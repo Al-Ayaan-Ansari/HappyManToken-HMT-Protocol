@@ -17,18 +17,16 @@ contract HMT_NFT is ERC721, ERC721Enumerable, Ownable {
     address public miningContract;
     uint256 public nextTokenId = 1;
 
-    // IPFS Base URI for Filebase
     string private _customBaseURI;
 
     struct Tier {
         uint256 price;
         uint256 maxSupply;
         uint256 minted;
+        bool ownerClaimed; // Tracks if the 10% allocation was minted
     }
 
     mapping(uint8 => Tier) public tiers;
-    
-    // Maps a specific Token ID to its Tier (Type)
     mapping(uint256 => uint8) public tokenTier; 
 
     event NFTBought(address indexed buyer, uint256 tokenId, uint8 tier);
@@ -39,24 +37,47 @@ contract HMT_NFT is ERC721, ERC721Enumerable, Ownable {
         USDT = IERC20(_usdt);
         ownerWallet = _ownerWallet;
 
-        // Initialize Tiers
-        tiers[1] = Tier(1000 * 1e18, 4000, 0);
-        tiers[2] = Tier(2500 * 1e18, 3000, 0);
-        tiers[3] = Tier(5000 * 1e18, 2000, 0);
-        tiers[4] = Tier(10000 * 1e18, 1000, 0);
-        tiers[5] = Tier(25000 * 1e18, 250, 0);
-        tiers[6] = Tier(50000 * 1e18, 100, 0);
-        tiers[7] = Tier(100000 * 1e18, 50, 0);
+        // 🟢 UPDATED: New exact max supplies as requested
+        tiers[1] = Tier(1000 * 1e18, 5000, 0, false);
+        tiers[2] = Tier(2500 * 1e18, 4000, 0, false);
+        tiers[3] = Tier(5000 * 1e18, 3000, 0, false);
+        tiers[4] = Tier(10000 * 1e18, 2000, 0, false);
+        tiers[5] = Tier(25000 * 1e18, 1000, 0, false);
+        tiers[6] = Tier(50000 * 1e18, 500, 0, false);
+        tiers[7] = Tier(100000 * 1e18, 250, 0, false);
+    }
+
+    // ==========================================
+    // 🟢 SAFE OWNER 10% ALLOCATION MINTING
+    // ==========================================
+    
+    /**
+     * @notice Mints exactly 10% of a specific tier's total supply to the owner.
+     * @dev Call this in a script loop (1 through 7) to avoid Block Gas Limit crashes.
+     */
+    function claimOwnerAllocation(uint8 _tier) external onlyOwner {
+        require(_tier >= 1 && _tier <= 7, "Invalid Tier");
+        Tier storage t = tiers[_tier];
+        require(!t.ownerClaimed, "Allocation already claimed for this tier");
+        
+        t.ownerClaimed = true;
+        uint256 amountToMint = t.maxSupply / 10; // 10% of total supply
+        
+        require(t.minted + amountToMint <= t.maxSupply, "Exceeds max supply");
+
+        t.minted += amountToMint;
+
+        for(uint256 i = 0; i < amountToMint; i++) {
+            uint256 tokenId = nextTokenId++;
+            tokenTier[tokenId] = _tier;
+            _safeMint(ownerWallet, tokenId);
+        }
     }
 
     // ==========================================
     // 🌐 FRONTEND HELPER (RPC SAFE)
     // ==========================================
 
-    /**
-     * @notice Returns an array of all Token IDs currently owned by a specific wallet.
-     * @dev This eliminates the need for the frontend to scan RPC logs for Transfer events.
-     */
     function getUserTokens(address _user) external view returns (uint256[] memory) {
         uint256 tokenCount = balanceOf(_user);
         uint256[] memory tokens = new uint256[](tokenCount);
@@ -81,13 +102,8 @@ contract HMT_NFT is ERC721, ERC721Enumerable, Ownable {
         return _customBaseURI;
     }
 
-    /**
-     * @dev Automatically formats the IPFS link based on the TIER, not the Token ID.
-     * Example: Token ID 1500 is a Tier 4 NFT. This returns ipfs://.../4.json
-     */
     function tokenURI(uint256 tokenId) public view virtual override returns (string memory) {
-        _requireOwned(tokenId); 
-        
+        _requireOwned(tokenId);
         uint8 tier = tokenTier[tokenId];
         string memory baseURI = _baseURI();
         

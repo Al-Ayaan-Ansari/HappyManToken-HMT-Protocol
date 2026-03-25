@@ -103,7 +103,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         uint256 lastClaimedCycle;    
         uint256 levelIncomeVault;    
         uint256 matrixRoyaltyVault;  
-        uint256 airdropVault; // 🟢 NEW: Dedicated vault for Airdrop ROI
+        uint256 airdropVault; // 🟢 Isolated Airdrop Vault
     }
 
     struct UserMatrix {
@@ -539,6 +539,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         emit NFTUnstaked(msg.sender, _tokenId);
     }
 
+    // 🟢 UPDATED: Unlocked 1% daily return to apply to all Tiers
     function getPendingNFTRewards(address _user) public view returns (uint256) {
         uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
         uint256 totalPending = 0;
@@ -550,10 +551,9 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             if (actualCycle > s.startCycle) {
                 for (uint256 c = s.startCycle; c < actualCycle; c++) {
                     totalPending += (cycleNFTRPS[c][s.tier] / 1e18);
-                    if (s.tier >= 2) {
-                        uint256 nftPrice = NFT.getTierPrice(s.tier);
-                        totalPending += (nftPrice * 1) / 100;
-                    }
+                    // 1% daily return applies to ALL NFTs (Tier 1-7)
+                    uint256 nftPrice = NFT.getTierPrice(s.tier);
+                    totalPending += (nftPrice * 1) / 100;
                 }
             }
         }
@@ -575,10 +575,9 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             if (actualCycle > s.startCycle) {
                 for (uint256 c = s.startCycle; c < actualCycle; c++) {
                     totalPayout += (cycleNFTRPS[c][s.tier] / 1e18);
-                    if (s.tier >= 2) {
-                        uint256 nftPrice = NFT.getTierPrice(s.tier);
-                        totalPayout += (nftPrice * 1) / 100;
-                    }
+                    // 1% daily return applies to ALL NFTs
+                    uint256 nftPrice = NFT.getTierPrice(s.tier);
+                    totalPayout += (nftPrice * 1) / 100;
                 }
                 s.startCycle = actualCycle;
             }
@@ -784,7 +783,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             u.lastAirdropClaimTime += (airdropCycles * 1 days);
             u.airdropClaimed += airdropPending;
             
-            // 🟢 NEW: Airdrops now go to their own separate, dedicated vault
+            // Routes to Airdrop Vault
             u.airdropVault += airdropPending; 
         }
         emit ROIClaimed(_user, basePending, airdropPending);
@@ -1071,7 +1070,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     // 💸 WITHDRAWAL ENGINE & FRONTEND VIEWS
     // ==========================================
 
-    // 🟢 UPDATED: Now returns two totals so the frontend knows exactly what is where
     function getTotalWithdrawable(address _user) external view returns (uint256 regularTotal, uint256 airdropTotal) {
         User memory u = users[_user];
         uint256 vaultedRegular = u.levelIncomeVault + u.matrixRoyaltyVault;
@@ -1092,31 +1090,26 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         airdropTotal = vaultedAirdrop + airdropPending;
     }
 
+    // 🟢 UPDATED: Strictly limits withdrawal to 10% of TOTAL INVESTMENT (Max $1000)
     function getDailyWithdrawLimit(address _user) public view returns (uint256 maxDaily, uint256 remainingToday) {
+        uint256 userInvested = users[_user].totalInvestment;
+        uint256 calculatedLimit = (userInvested * 10) / 100;
+        
+        // Hard Cap at 1000 USDT (scaled to 1e18)
+        uint256 hardCap = 1000 * 1e18;
+        maxDaily = calculatedLimit > hardCap ? hardCap : calculatedLimit;
+
         WithdrawWindow memory window = userWithdrawWindows[_user];
         
         if (block.timestamp < window.windowStartTime + 24 hours) {
-            maxDaily = window.maxDailyLimit;
+            maxDaily = window.maxDailyLimit; // Respect the 24h snapshot limit
             remainingToday = maxDaily > window.withdrawnAmount ? maxDaily - window.withdrawnAmount : 0;
         } 
         else {
-            // 🟢 The 10% limit allows them to withdraw up to 10% of their ENTIRE combined portfolio 
-            uint256 simulatedAvailable = users[_user].levelIncomeVault + users[_user].matrixRoyaltyVault + users[_user].airdropVault;
-            
-            (uint256 baseP, uint256 airP) = getPendingROI(_user);
-            simulatedAvailable += baseP + airP;
-            
-            if (users[_user].isMatrixUnlocked) {
-                simulatedAvailable += getPendingMatrixRewards(_user); 
-            }
-            simulatedAvailable += getPendingNFTRewards(_user);
-
-            maxDaily = (simulatedAvailable * 10) / 100;
             remainingToday = maxDaily;
         }
     }
 
-    // 🟢 UPDATED: Single function with a boolean flag to route the withdrawal
     function withdraw(uint256 _amount, bool _isAirdropWithdrawal) external nonReentrant {
         _processOwnerPayout();
         _autoLiquidateChunk();
@@ -1127,7 +1120,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         
         User storage u = users[msg.sender];
         
-        // 1. Verify they have enough in the specifically requested vault
         uint256 specificVaultAvailable;
         if (_isAirdropWithdrawal) {
             specificVaultAvailable = u.airdropVault;
@@ -1137,29 +1129,31 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         
         if (_amount == 0 || specificVaultAvailable < _amount) revert InsufficientVault();
 
-        // 2. Validate against their global 10% portfolio limit
-        uint256 combinedAvailable = u.levelIncomeVault + u.matrixRoyaltyVault + u.airdropVault;
+        // 🟢 UPDATED: 10% Total Investment Rule applies to the active withdraw snapshot
+        uint256 userInvested = u.totalInvestment;
+        uint256 calculatedLimit = (userInvested * 10) / 100;
+        uint256 hardCap = 1000 * 1e18;
+        uint256 dailyCap = calculatedLimit > hardCap ? hardCap : calculatedLimit;
 
         WithdrawWindow storage window = userWithdrawWindows[msg.sender];
+        
         if (block.timestamp >= window.windowStartTime + 24 hours) {
             window.windowStartTime = block.timestamp;
             window.withdrawnAmount = 0;
-            window.maxDailyLimit = (combinedAvailable * 10) / 100; 
+            window.maxDailyLimit = dailyCap; 
         }
         
         if (window.withdrawnAmount + _amount > window.maxDailyLimit) revert ExceedsDailyLimit();
         
         window.withdrawnAmount += _amount;
 
-        // 3. Deduct from the correct vault and handle Diamond Hand forfeiture
         if (_isAirdropWithdrawal) {
             if (!u.hasWithdrawn) {
                 u.hasWithdrawn = true;
-                emit AirdropForfeited(msg.sender); // 🚨 Only triggers if withdrawing Airdrop
+                emit AirdropForfeited(msg.sender);
             }
             u.airdropVault -= _amount;
         } else {
-            // Standard withdrawal does NOT forfeit the airdrop
             if (_amount <= u.levelIncomeVault) {
                 u.levelIncomeVault -= _amount;
             } else {
@@ -1169,7 +1163,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             }
         }
 
-        // 4. Execute the final transfer logic
         uint256 fee = (_amount * 5) / 100;
         uint256 netPayoutUSDT = _amount - fee;
         USDT.safeTransfer(ownerWallet, fee);
