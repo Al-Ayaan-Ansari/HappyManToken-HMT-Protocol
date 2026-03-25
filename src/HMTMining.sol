@@ -17,8 +17,20 @@ interface IHMTToken is IERC20 {
     function getUSDTForHMT(uint256 hmtAmount) external view returns (uint256);
 }
 
+interface IPancakeFactory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IPancakePair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
+
 interface IPancakeRouter02 {
+    function factory() external pure returns (address);
     function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) external returns (uint256[] memory amounts);
+    function addLiquidity(address tokenA, address tokenB, uint256 amountADesired, uint256 amountBDesired, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
 }
 
 interface INFTContract is IERC721 {
@@ -28,7 +40,7 @@ interface INFTContract is IERC721 {
 }
 
 // ==========================================
-// 🚨 CUSTOM ERRORS (Bytecode Optimization)
+// 🚨 CUSTOM ERRORS
 // ==========================================
 error ZeroAddress();
 error AlreadyEntered();
@@ -79,6 +91,9 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     uint256 public constant WEEKLY_MAINTENANCE = 1000 * 1e18;
     uint256 public constant OWNER_CYCLE_PAYOUT = 21_000 * 1e18; 
     uint256 public constant MAX_OWNER_PAYOUTS = 100;
+
+    // 🟢 Industry Standard Burn Address for permanent LP locking
+    address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
     
     bool public isPayoutLockedToHMT = false;
     uint256 public ownerPayoutsClaimed;
@@ -97,13 +112,13 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         address strongestLegUser;    
         uint256 lastBaseClaimTime;     
         uint256 baseClaimed;           
-        uint256 lastAirdropClaimTime;  
+        uint256 lastAirdropCycle; 
         uint256 airdropClaimed;
         bool hasWithdrawn;             
         uint256 lastClaimedCycle;    
         uint256 levelIncomeVault;    
         uint256 matrixRoyaltyVault;  
-        uint256 airdropVault; // 🟢 Isolated Airdrop Vault
+        uint256 airdropVault; 
     }
 
     struct UserMatrix {
@@ -135,6 +150,8 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     mapping(address => mapping(uint256 => uint256)) public weeklyTotalVolume;
     mapping(address => mapping(uint256 => uint256)) public weeklyStrongestLegVolume;
     mapping(address => mapping(address => mapping(uint256 => uint256))) public weeklyLegVolume;
+
+    mapping(address => mapping(uint256 => bool)) public airdropEligible;
 
     uint256[10] public totalSharesPerTier;
     uint256[10] public tierPercentages = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -187,7 +204,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     }
     mapping(address => TokenStake[]) public userTokenStakes;
 
-    event Invested(address indexed user, uint256 amount, bool isThirtySeventyRatio);
+    event Invested(address indexed user, uint256 amount, bool isTwentyEightyRatio);
     event FeePaid(address indexed user, uint256 feeAmount);
     event ROIClaimed(address indexed user, uint256 baseAmount, uint256 airdropAmount);
     event LevelIncomeDistributed(address indexed sponsor, address indexed downline, uint256 amount, uint8 level);
@@ -208,6 +225,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     event HMTSwappedForUSDT(address indexed user, uint256 hmtIn, uint256 usdtOut);
     event TokensStaked(address indexed user, uint256 amount, uint256 stakeIndex);
     event AllTokensUnstaked(address indexed user, uint256 totalPayout, uint256 totalPenalty);
+    event LiquidityAutoBalanced(address indexed triggerer, uint256 hmtAdded, uint256 usdtAdded);
 
     constructor(
         address _usdt, address _hmt, address _router, address _companyWallet, address _ownerWallet, address _nftContract
@@ -230,19 +248,14 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
 
     function _processOwnerPayout() internal {
         if (ownerPayoutsClaimed >= MAX_OWNER_PAYOUTS) return;
-        
         uint256 cyclesPassed = (block.timestamp - launchTime) / CYCLE_DURATION;
-        
         if (cyclesPassed > ownerPayoutsClaimed) {
             uint256 pendingPayouts = cyclesPassed - ownerPayoutsClaimed;
-            
             if (ownerPayoutsClaimed + pendingPayouts > MAX_OWNER_PAYOUTS) {
                 pendingPayouts = MAX_OWNER_PAYOUTS - ownerPayoutsClaimed;
             }
-            
             if (pendingPayouts > 0) {
                 uint256 payoutAmount = pendingPayouts * OWNER_CYCLE_PAYOUT;
-                
                 if (HMT.balanceOf(address(this)) >= payoutAmount) {
                     ownerPayoutsClaimed += pendingPayouts;
                     HMT.safeTransfer(ownerWallet, payoutAmount);
@@ -250,6 +263,52 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
                 }
             }
         }
+    }
+
+    // ==========================================
+    // 🌊 AUTO-BALANCE PROTOCOL LIQUIDITY
+    // ==========================================
+
+    function autoBalanceLiquidity() external nonReentrant {
+        address factory = pancakeRouter.factory();
+        address pair = IPancakeFactory(factory).getPair(address(HMT), address(USDT));
+        require(pair != address(0), "Liquidity pair not created");
+
+        uint256 hmtReserve;
+        address token0 = IPancakePair(pair).token0();
+        (uint112 reserve0, uint112 reserve1, ) = IPancakePair(pair).getReserves();
+        
+        if (token0 == address(HMT)) {
+            hmtReserve = reserve0;
+        } else {
+            hmtReserve = reserve1;
+        }
+
+        // Trigger condition: HMT capacity in pool is strictly below 600 HMT
+        uint256 threshold = 600 * 1e18;
+        require(hmtReserve < threshold, "HMT capacity is above 60%");
+
+        uint256 hmtToAdd = 1000 * 1e18;
+        uint256 usdtRequired = HMT.getUSDTForHMT(hmtToAdd);
+
+        require(HMT.balanceOf(address(this)) >= hmtToAdd, "Insufficient HMT in Treasury");
+        require(USDT.balanceOf(address(this)) >= usdtRequired, "Insufficient USDT in Treasury");
+
+        HMT.approve(address(pancakeRouter), hmtToAdd);
+        USDT.approve(address(pancakeRouter), usdtRequired);
+
+        pancakeRouter.addLiquidity(
+            address(HMT),
+            address(USDT),
+            hmtToAdd,
+            usdtRequired,
+            0,
+            0,
+            DEAD_ADDRESS, // 🟢 UPDATED: LP tokens are permanently burned (sent to 0x...dead)
+            block.timestamp + 300
+        );
+        
+        emit LiquidityAutoBalanced(msg.sender, hmtToAdd, usdtRequired);
     }
 
     // ==========================================
@@ -366,7 +425,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             activeLoanUsers[index] = lastUser;
             activeLoanIndex[lastUser] = index;
         }
-
         activeLoanUsers.pop();
         delete activeLoanIndex[_user];
     }
@@ -396,7 +454,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         if (length == 0) return;
 
         uint256 checks = 0;
-        
         while (checks < AUTO_BATCH_SIZE && activeLoanUsers.length > 0) {
             if (currentLiquidationIndex >= activeLoanUsers.length) {
                 currentLiquidationIndex = 0;
@@ -539,7 +596,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         emit NFTUnstaked(msg.sender, _tokenId);
     }
 
-    // 🟢 UPDATED: Unlocked 1% daily return to apply to all Tiers
     function getPendingNFTRewards(address _user) public view returns (uint256) {
         uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
         uint256 totalPending = 0;
@@ -551,7 +607,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             if (actualCycle > s.startCycle) {
                 for (uint256 c = s.startCycle; c < actualCycle; c++) {
                     totalPending += (cycleNFTRPS[c][s.tier] / 1e18);
-                    // 1% daily return applies to ALL NFTs (Tier 1-7)
                     uint256 nftPrice = NFT.getTierPrice(s.tier);
                     totalPending += (nftPrice * 1) / 100;
                 }
@@ -575,7 +630,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             if (actualCycle > s.startCycle) {
                 for (uint256 c = s.startCycle; c < actualCycle; c++) {
                     totalPayout += (cycleNFTRPS[c][s.tier] / 1e18);
-                    // 1% daily return applies to ALL NFTs
                     uint256 nftPrice = NFT.getTierPrice(s.tier);
                     totalPayout += (nftPrice * 1) / 100;
                 }
@@ -593,7 +647,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     // 💰 INVEST & BUBBLE-UP
     // ==========================================
 
-    function invest(address _sponsor, uint256 _amount, bool _isThirtySeventy) external nonReentrant {
+    function invest(address _sponsor, uint256 _amount, bool _isTwentyEighty) external nonReentrant {
         if (_amount < MIN_INVESTMENT) revert BelowMinLimit();
         
         InvestmentWindow storage window = userInvestmentWindows[msg.sender];
@@ -607,7 +661,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
 
         if (_sponsor == address(0)) revert ZeroAddress();
         _processOwnerPayout();
-        
         _autoLiquidateChunk();
         
         if (users[msg.sender].totalInvestment > 0) {
@@ -616,13 +669,20 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             _internalClaimNFTRewards(msg.sender);
         }
 
+        address activeSponsor = users[msg.sender].sponsor == address(0) ? _sponsor : users[msg.sender].sponsor;
+
+        if (_amount >= 100 * 1e18 && activeSponsor != address(0) && activeSponsor != companyWallet) {
+            uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+            airdropEligible[activeSponsor][currentCycle + 1] = true; 
+        }
+
         if (users[msg.sender].sponsor == address(0) && msg.sender != companyWallet) {
             if (users[_sponsor].totalInvestment == 0 && _sponsor != companyWallet) revert InvalidSponsor();
             
             users[msg.sender].sponsor = _sponsor;
             users[msg.sender].registrationTime = block.timestamp;
             users[msg.sender].lastBaseClaimTime = block.timestamp;
-            users[msg.sender].lastAirdropClaimTime = block.timestamp;
+            users[msg.sender].lastAirdropCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
             users[msg.sender].lastClaimedCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
 
             users[_sponsor].directReferralsCount++;
@@ -650,7 +710,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
                         }
                     }
                 }
-            
             }
         }
 
@@ -660,7 +719,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         emit FeePaid(msg.sender, fee);
 
         uint256 netAmount = _amount - fee;
-        uint256 swapRatio = _isThirtySeventy ? 30 : 70;
+        uint256 swapRatio = _isTwentyEighty ? 20 : 80;
         uint256 swapAmount = (netAmount * swapRatio) / 100;
         
         _buyHMT(swapAmount);
@@ -674,7 +733,7 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         _updateUplineVolume(msg.sender, _amount);
         _distributeMatrixRoyalty(_amount);
 
-        emit Invested(msg.sender, _amount, _isThirtySeventy);
+        emit Invested(msg.sender, _amount, _isTwentyEighty);
     }
 
     function _buyHMT(uint256 usdtAmount) internal {
@@ -729,6 +788,16 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
     // 📊 PHASE 2: DUAL ROI & LEVEL INCOME
     // ==========================================
 
+    function isAirdropEligibleThisCycle(address _user) public view returns (bool) {
+        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+        return airdropEligible[_user][currentCycle];
+    }
+    
+    function isAirdropUnlockedForNextCycle(address _user) public view returns (bool) {
+        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+        return airdropEligible[_user][currentCycle + 1];
+    }
+
     function getPendingROI(address _user) public view returns (uint256 basePending, uint256 airdropPending) {
         if (_user == companyWallet) return (0, 0);
         User memory u = users[_user];
@@ -743,15 +812,21 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         }
 
         if (u.totalInvestment >= 100 * 1e18 && !u.hasWithdrawn) {
-            uint256 airdropCycles = (block.timestamp - u.lastAirdropClaimTime) / 1 days;
-            if (airdropCycles > 0) {
-                uint256 airdropCap = u.totalInvestment * 5;
-                uint256 airdropPerDay = (airdropCap * 1) / 1000; 
-                uint256 calculatedAirdrop = airdropPerDay * airdropCycles;
-                airdropPending = (u.airdropClaimed + calculatedAirdrop > airdropCap) ? 
-                    (airdropCap > u.airdropClaimed ? airdropCap - u.airdropClaimed : 0) : calculatedAirdrop;
+            uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+            uint256 airdropCap = u.totalInvestment * 5;
+            uint256 cycleReward = (u.totalInvestment * 28) / 1000; 
+            
+            for (uint256 c = u.lastAirdropCycle; c < actualCycle; c++) {
+                if (airdropEligible[_user][c]) {
+                    airdropPending += cycleReward;
+                }
+            }
+            
+            if (u.airdropClaimed + airdropPending > airdropCap) {
+                airdropPending = airdropCap > u.airdropClaimed ? airdropCap - u.airdropClaimed : 0;
             }
         }
+        
         return (basePending, airdropPending);
     }
 
@@ -766,9 +841,10 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
 
     function _internalClaimROI(address _user) internal {
         (uint256 basePending, uint256 airdropPending) = getPendingROI(_user);
-        if (basePending == 0 && airdropPending == 0) return;
 
         User storage u = users[_user];
+        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+
         if (basePending > 0) {
             uint256 baseCycles = (block.timestamp - u.lastBaseClaimTime) / 8 hours;
             u.lastBaseClaimTime += (baseCycles * 8 hours);
@@ -778,15 +854,19 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             _distributeLevelIncome(_user, basePending);
         }
 
-        if (airdropPending > 0) {
-            uint256 airdropCycles = (block.timestamp - u.lastAirdropClaimTime) / 1 days;
-            u.lastAirdropClaimTime += (airdropCycles * 1 days);
-            u.airdropClaimed += airdropPending;
-            
-            // Routes to Airdrop Vault
-            u.airdropVault += airdropPending; 
+        if (u.totalInvestment >= 100 * 1e18 && !u.hasWithdrawn) {
+            if (actualCycle > u.lastAirdropCycle) {
+                u.lastAirdropCycle = actualCycle;
+                if (airdropPending > 0) {
+                    u.airdropClaimed += airdropPending;
+                    u.airdropVault += airdropPending; 
+                }
+            }
         }
-        emit ROIClaimed(_user, basePending, airdropPending);
+        
+        if (basePending > 0 || airdropPending > 0) {
+            emit ROIClaimed(_user, basePending, airdropPending);
+        }
     }
 
     function _distributeLevelIncome(address _claimer, uint256 _baseROI) internal {
@@ -1090,19 +1170,17 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         airdropTotal = vaultedAirdrop + airdropPending;
     }
 
-    // 🟢 UPDATED: Strictly limits withdrawal to 10% of TOTAL INVESTMENT (Max $1000)
     function getDailyWithdrawLimit(address _user) public view returns (uint256 maxDaily, uint256 remainingToday) {
         uint256 userInvested = users[_user].totalInvestment;
         uint256 calculatedLimit = (userInvested * 10) / 100;
         
-        // Hard Cap at 1000 USDT (scaled to 1e18)
         uint256 hardCap = 1000 * 1e18;
         maxDaily = calculatedLimit > hardCap ? hardCap : calculatedLimit;
 
         WithdrawWindow memory window = userWithdrawWindows[_user];
         
         if (block.timestamp < window.windowStartTime + 24 hours) {
-            maxDaily = window.maxDailyLimit; // Respect the 24h snapshot limit
+            maxDaily = window.maxDailyLimit; 
             remainingToday = maxDaily > window.withdrawnAmount ? maxDaily - window.withdrawnAmount : 0;
         } 
         else {
@@ -1129,7 +1207,6 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
         
         if (_amount == 0 || specificVaultAvailable < _amount) revert InsufficientVault();
 
-        // 🟢 UPDATED: 10% Total Investment Rule applies to the active withdraw snapshot
         uint256 userInvested = u.totalInvestment;
         uint256 calculatedLimit = (userInvested * 10) / 100;
         uint256 hardCap = 1000 * 1e18;
