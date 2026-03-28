@@ -8,20 +8,15 @@ import {HMTToken} from "../src/HMTToken.sol";
 import {HMT_NFT} from "../src/HMTNFT.sol"; 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-// 🟢 Interface for live AMM Liquidity Injection
 interface IPancakeRouter02Test {
     function addLiquidity(address tokenA, address tokenB, uint amountADesired, uint amountBDesired, uint amountAMin, uint amountBMin, address to, uint deadline) external returns (uint amountA, uint amountB, uint liquidity);
 }
 
-// ==========================================
-// 🧪 THE LIVE FORK SHOWCASE TEST SUITE
-// ==========================================
 contract HMTClientShowcaseTest is Test {
     HMTMining public mining;
     HMTToken public hmt;
     HMT_NFT public nft; 
 
-    // 🟢 Real BSC Mainnet Addresses
     address constant PANCAKESWAP_ROUTER = 0x10ED43C718714eb63d5aA57B78B54704E256024E;
     address constant BSC_USDT = 0x55d398326f99059fF775485246999027B3197955;
 
@@ -30,12 +25,9 @@ contract HMTClientShowcaseTest is Test {
     uint160 private dummyNonce = 9999999;
 
     function setUp() public {
-        // 🟢 Deploying the REAL Contracts on the Live Fork
         nft = new HMT_NFT(BSC_USDT, ownerWallet);
         hmt = new HMTToken(BSC_USDT, PANCAKESWAP_ROUTER);
         mining = new HMTMining(BSC_USDT, address(hmt), PANCAKESWAP_ROUTER, company, ownerWallet, address(nft));
-        
-        // Link them together securely
         hmt.setMiningContract(address(mining));
         nft.setMiningContract(address(mining));
 
@@ -47,7 +39,6 @@ contract HMTClientShowcaseTest is Test {
         hmt.transfer(company, hmtLiquidity); 
         hmt.transfer(address(mining), ownerShare);
 
-        // Inject live liquidity to PancakeSwap
         vm.startPrank(company);
         IERC20(BSC_USDT).approve(PANCAKESWAP_ROUTER, usdtLiquidity);
         hmt.approve(PANCAKESWAP_ROUTER, hmtLiquidity);
@@ -60,22 +51,18 @@ contract HMTClientShowcaseTest is Test {
     function _usd(uint256 amount) internal pure returns (string memory) {
         uint256 dollars = amount / 1e18;
         uint256 cents = ((amount % 1e18) * 100) / 1e18;
-        string memory centsStr = cents < 10 ?
-            string(abi.encodePacked("0", vm.toString(cents))) : vm.toString(cents);
+        string memory centsStr = cents < 10 ? string(abi.encodePacked("0", vm.toString(cents))) : vm.toString(cents);
         return string(abi.encodePacked("$", vm.toString(dollars), ".", centsStr));
     }
 
-    // 🟢 Smart Invest dynamically respects the V2 24-Hour Window mapping
     function _invest(address _user, address _sponsor, uint256 _totalAmount) internal {
         (uint256 windowStartTime, uint256 windowTotalInvested) = mining.userInvestmentWindows(_user);
-        
         uint256 userInvestedToday = (block.timestamp >= windowStartTime + 24 hours) ? 0 : windowTotalInvested;
         uint256 userCanInvest = 2500 * 1e18 > userInvestedToday ? (2500 * 1e18) - userInvestedToday : 0;
-        
         uint256 amountForUser = _totalAmount > userCanInvest ? userCanInvest : _totalAmount;
-
+        
         if (amountForUser > 0) {
-            deal(BSC_USDT, _user, amountForUser); // 🟢 Now using `deal` and live USDT
+            deal(BSC_USDT, _user, amountForUser);
             vm.startPrank(_user);
             IERC20(BSC_USDT).approve(address(mining), amountForUser);
             mining.invest(_sponsor, amountForUser, false);
@@ -86,7 +73,7 @@ contract HMTClientShowcaseTest is Test {
         while(amountLeft > 0) {
             uint256 chunk = amountLeft > 2500 * 1e18 ? 2500 * 1e18 : amountLeft;
             address dummy = address(dummyNonce++);
-            deal(BSC_USDT, dummy, chunk); // 🟢 Now using `deal` and live USDT
+            deal(BSC_USDT, dummy, chunk);
             vm.startPrank(dummy);
             IERC20(BSC_USDT).approve(address(mining), chunk);
             mining.invest(_user, chunk, false); 
@@ -95,7 +82,6 @@ contract HMTClientShowcaseTest is Test {
         }
     }
 
-    // Helper: Generates exactly $1000 in Weaker Leg Volume for a leader in the current week
     function _generateWeeklyVolume(address leader) internal {
         address strongLeg = address(dummyNonce++);
         address weakLeg = address(dummyNonce++);
@@ -103,11 +89,8 @@ contract HMTClientShowcaseTest is Test {
         _invest(weakLeg, leader, 1000 * 1e18);   // $1000 Weak Leg
     }
 
-    // Helper: Builds a Tier 1 Qualified Leader (100% Unique Addresses)
     function _buildTier1Leader(address leader) internal {
         _invest(leader, company, 1000 * 1e18);
-        
-        // 39-Person Matrix
         for (uint i = 1; i <= 3; i++) {
             address l1 = address(dummyNonce++);
             _invest(l1, leader, 100 * 1e18);
@@ -121,12 +104,10 @@ contract HMTClientShowcaseTest is Test {
             }
         }
         
-        // $10,000 Weaker Lifetime Volume
         _invest(address(dummyNonce++), leader, 15000 * 1e18); // Strong Leg
         _invest(address(dummyNonce++), leader, 5000 * 1e18);  // Weak Leg
         _invest(address(dummyNonce++), leader, 5000 * 1e18);  // Weak Leg
         
-        // Claim to Sync Tier 1
         vm.prank(leader);
         mining.claimROI();
     }
@@ -143,24 +124,18 @@ contract HMTClientShowcaseTest is Test {
         address leaderAlice = address(0xA11CE);
         address leaderBob = address(0xB0B);
         address leaderCharlie = address(0xC4A211E);
-
         console.log("[DAY 0] Alice, Bob, and Charlie all build their teams and unlock Tier 1.");
         
         _buildTier1Leader(leaderAlice);
         _buildTier1Leader(leaderBob);
         _buildTier1Leader(leaderCharlie);
-
+        
         uint256 t1Shares = mining.totalSharesPerTier(1);
         console.log(string(abi.encodePacked("[SYSTEM] Total Tier 1 Qualified Shares: ", vm.toString(t1Shares))));
 
-        // =====================================
-        // CYCLE 1: THE GLOBAL POT & THE WEEKLY GRIND
-        // =====================================
         vm.warp(mining.launchTime() + 28 days);
-
         console.log("\n[CYCLE 1 BEGINS - DAY 28]");
         console.log(">> A massive Global Whale deposits $300,000 into the network!");
-
         _invest(address(dummyNonce++), company, 300000 * 1e18);
         
         console.log("   -> Contract slices 18% Royalty: $54,000 to the Global Pool.");
@@ -168,50 +143,46 @@ contract HMTClientShowcaseTest is Test {
         console.log("   -> Since there are 3 shares, each Leader is fighting for exactly $360.00!\n");
 
         console.log("[WEEK 1] Days 28-34...");
-        console.log("   Alice:   $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderAlice);
-        console.log("   Bob:     $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderBob);
-        console.log("   Charlie: $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderCharlie);
+        console.log("   Alice:   $1,000 Weaker Vol "); _generateWeeklyVolume(leaderAlice);
+        console.log("   Bob:     $1,000 Weaker Vol "); _generateWeeklyVolume(leaderBob);
+        console.log("   Charlie: $1,000 Weaker Vol "); _generateWeeklyVolume(leaderCharlie);
 
         vm.warp(mining.launchTime() + 35 days);
         console.log("\n[WEEK 2] Days 35-41...");
-        console.log("   Alice:   $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderAlice);
-        console.log("   Bob:     $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderBob);
-        console.log("   Charlie: $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderCharlie);
+        console.log("   Alice:   $1,000 Weaker Vol "); _generateWeeklyVolume(leaderAlice);
+        console.log("   Bob:     $1,000 Weaker Vol "); _generateWeeklyVolume(leaderBob);
+        console.log("   Charlie: $1,000 Weaker Vol "); _generateWeeklyVolume(leaderCharlie);
 
         vm.warp(mining.launchTime() + 42 days);
         console.log("\n[WEEK 3] Days 42-48 (THE MISTAKE)");
-        console.log("   Alice:   $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderAlice);
-        console.log("   Bob:     $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderBob);
-        console.log("   Charlie: Goes on vacation. $0 Vol \xE2\x9D\x8C"); // Charlie skips!
+        console.log("   Alice:   $1,000 Weaker Vol "); _generateWeeklyVolume(leaderAlice);
+        console.log("   Bob:     $1,000 Weaker Vol "); _generateWeeklyVolume(leaderBob);
+        console.log("   Charlie: Goes on vacation. $0 Vol "); // Charlie skips!
 
         vm.warp(mining.launchTime() + 49 days);
-
         console.log("\n[WEEK 4] Days 49-55...");
-        console.log("   Alice:   $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderAlice);
-        console.log("   Bob:     $1,000 Weaker Vol \xE2\x9C\x85"); _generateWeeklyVolume(leaderBob);
-        console.log("   Charlie: $1,000 Weaker Vol \xE2\x9C\x85 (But it's too late...)"); _generateWeeklyVolume(leaderCharlie);
+        console.log("   Alice:   $1,000 Weaker Vol "); _generateWeeklyVolume(leaderAlice);
+        console.log("   Bob:     $1,000 Weaker Vol "); _generateWeeklyVolume(leaderBob);
+        console.log("   Charlie: $1,000 Weaker Vol  (But it's too late...)"); _generateWeeklyVolume(leaderCharlie);
 
-        // =====================================
-        // JUMP TO CYCLE 2 (DAY 56) PAYOUTS
-        // =====================================
         vm.warp(mining.launchTime() + 56 days);
-
         console.log("\n========================================================");
         console.log("[CYCLE 1 COMPLETE - DAY 56] PAYOUT DISTRIBUTION");
         console.log("========================================================\n");
 
+        // 🟢 UPDATED: Unpack 19th item correctly
         vm.prank(leaderAlice); mining.claimROI();
-        (,,,,,,,,,,,,,,,,,, uint256 aVault) = mining.users(leaderAlice);
-        console.log("Leader Alice Vault (Passed 4/4 Weeks):   ", _usd(aVault), " \xE2\x9C\x85");
+        (,,,,,,,,,,,,,,,,,, uint256 aVault, ) = mining.users(leaderAlice);
+        console.log("Leader Alice Vault (Passed 4/4 Weeks):   ", _usd(aVault), " ");
 
         vm.prank(leaderBob); mining.claimROI();
-        (,,,,,,,,,,,,,,,,,, uint256 bVault) = mining.users(leaderBob);
-        console.log("Leader Bob Vault   (Passed 4/4 Weeks):   ", _usd(bVault), " \xE2\x9C\x85");
+        (,,,,,,,,,,,,,,,,,, uint256 bVault, ) = mining.users(leaderBob);
+        console.log("Leader Bob Vault   (Passed 4/4 Weeks):   ", _usd(bVault), " ");
 
         vm.prank(leaderCharlie); mining.claimROI();
-        (,,,,,,,,,,,,,,,,,, uint256 cVault) = mining.users(leaderCharlie);
-        console.log("Leader Charlie Vault (Failed Week 3):    ", _usd(cVault), " \xE2\x9D\x8C");
-
+        (,,,,,,,,,,,,,,,,,, uint256 cVault, ) = mining.users(leaderCharlie);
+        console.log("Leader Charlie Vault (Failed Week 3):    ", _usd(cVault), " ");
+        
         console.log("\n[EXPLANATION FOR CLIENT]");
         console.log("Because Charlie missed his Week 3 Maintenance, the smart contract ");
         console.log("instantly revoked his Tier 1 payout for this cycle and dropped him ");
@@ -220,7 +191,7 @@ contract HMTClientShowcaseTest is Test {
     }
 
     // ==========================================
-    // 🟢 SHOWCASE 6: NFT STAKING & ROYALTY REWARDS (TIER 2 PROOF)
+    // 🟢 SHOWCASE 6: NFT STAKING & ROYALTY REWARDS
     // ==========================================
     function test_Client_Showcase_6_NFTRoyaltyStaking() public {
         console.log("\n========================================================");
@@ -230,31 +201,22 @@ contract HMTClientShowcaseTest is Test {
         console.log("========================================================\n");
 
         address investorNFT = address(0x777);
-        
-        // 1. Give user live USDT and buy the Tier 2 NFT
-        deal(BSC_USDT, investorNFT, 2_500 * 1e18); // 🟢 Now using `deal`
+        deal(BSC_USDT, investorNFT, 2_500 * 1e18);
         
         vm.startPrank(investorNFT);
-        IERC20(BSC_USDT).approve(address(nft), 2_500 * 1e18); // 🟢 Approving live USDT
+        IERC20(BSC_USDT).approve(address(nft), 2_500 * 1e18);
         nft.buyNFT(2);
-        
-        // 2. User stakes the NFT into the Mining Contract
-        nft.approve(address(mining), 1); // Approve Token ID #1
+        nft.approve(address(mining), 1);
         mining.stakeNFT(1);
         vm.stopPrank();
-
+        
         console.log("[CYCLE 0] User stakes Tier 2 NFT (Token ID #1).");
         console.log("   -> Contract locks NFT. Yield generation begins next cycle.\n");
-
-        // =====================================
-        // JUMP TO CYCLE 1 (DAY 28)
-        // =====================================
+        
         vm.warp(mining.launchTime() + 28 days);
-
         console.log("[CYCLE 1 ONGOING - DAY 28 to 56]");
         console.log(">> A massive Global Whale deposits $100,000 into the network!");
-
-        // Whale invests $100k
+        
         _invest(address(dummyNonce++), company, 100_000 * 1e18);
 
         console.log("\n[SMART CONTRACT INTERNAL MATH]");
@@ -264,22 +226,17 @@ contract HMTClientShowcaseTest is Test {
         console.log("   4. Tier 2 Fixed Bonus (1% of $2,500 NFT Price): $25.00");
         console.log("   -> EXPECTED CYCLE 1 TOTAL: $385.00\n");
 
-        // =====================================
-        // JUMP TO CYCLE 2 (DAY 56) PAYOUTS
-        // =====================================
         vm.warp(mining.launchTime() + 56 days);
         console.log("[CYCLE 1 COMPLETE - DAY 56] USER CLAIMS REWARDS");
         
-        // View Pending Rewards
         uint256 pending = mining.getPendingNFTRewards(investorNFT);
         console.log("   -> Contract pre-calculates pending rewards: ", _usd(pending));
         
-        // Execute Claim
         vm.prank(investorNFT);
         mining.claimNFTRewards();
 
-        // Verify Vault Balance
-        (,,,,,,,,,,,,,,,,,, uint256 royaltyVault) = mining.users(investorNFT);
+        // 🟢 UPDATED: Unpack 19th item correctly
+        (,,,,,,,,,,,,,,,,,, uint256 royaltyVault, ) = mining.users(investorNFT);
         console.log("\n[PAYOUT EXECUTION]");
         console.log("   -> User Liquid Vault Receives: ", _usd(royaltyVault));
         console.log("   -> EXACT MATCH: $385.00 Verified ");

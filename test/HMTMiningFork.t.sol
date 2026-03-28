@@ -34,6 +34,7 @@ contract HMTMiningForkTest is Test {
 
     address public company = address(0x100);
     address public ownerWallet = address(0x200);
+
     address public user1 = address(0x1);
     address public user2 = address(0x2);
     address public user3 = address(0x3);
@@ -71,7 +72,7 @@ contract HMTMiningForkTest is Test {
         if (_totalAmount <= 2500 * 1e18) {
             vm.startPrank(_user);
             IERC20(BSC_USDT).approve(address(mining), _totalAmount);
-            mining.invest(_sponsor, _totalAmount, false);
+            mining.invest(_sponsor, _totalAmount, false); // false = 80/20 split
             vm.stopPrank();
         } else {
             vm.startPrank(_user);
@@ -99,20 +100,44 @@ contract HMTMiningForkTest is Test {
         vm.warp(block.timestamp + 24 hours);
         (uint256 pendingBase, ) = mining.getPendingROI(user1);
         assertEq(pendingBase, 6 * 1e18, "Base ROI should be exactly 6 USDT after 24 hours");
+        
         vm.prank(user1);
         mining.claimROI();
-        (,,,,,,,,,,,,,,,,, uint256 vaultBalance, ) = mining.users(user1);
-        assertEq(vaultBalance, 11 * 1e18, "Vault should contain 6 USDT (Base) + 5 USDT (Airdrop)");
+        (,,,,,,,,,,,,,,,,, uint256 vaultBalance,, ) = mining.users(user1);
+        assertEq(vaultBalance, 6 * 1e18, "Vault should contain exactly 6 USDT (Base)");
     }
 
+    // 🟢 NEW: PIPELINE AIRDROP TEST
     function test_AirdropROI_And_Penalty() public {
+        // User invests 1000 USDT (Eligible for Airdrop)
         _invest(user2, company, 1000 * 1e18);
-        vm.warp(block.timestamp + 2 days);
+
+        // Current Cycle is 0. Give User2 a direct referral of $100+ to unlock Cycle 1!
+        address dummyRef = address(0x999);
+        deal(BSC_USDT, dummyRef, 100 * 1e18);
+        vm.startPrank(dummyRef);
+        IERC20(BSC_USDT).approve(address(mining), 100 * 1e18);
+        mining.invest(user2, 100 * 1e18, false);
+        vm.stopPrank();
+
+        // Warp 56 Days (Finishes Cycle 0, AND Finishes Cycle 1)
+        vm.warp(mining.launchTime() + 56 days);
+
         (uint256 basePending, uint256 airdropPending) = mining.getPendingROI(user2);
-        assertEq(airdropPending, 10 * 1e18, "Airdrop should be 10 USDT for 2 days");
+        
+        // Airdrop should be 2.8% of 1000 USDT = 28 USDT (For the completed Cycle 1)
+        assertEq(airdropPending, 28 * 1e18, "Airdrop should be exactly 2.8% for the unlocked cycle");
+
+        // Claim to Vault
         vm.prank(user2);
-        mining.withdraw(1 * 1e18);
-        vm.warp(block.timestamp + 1 days);
+        mining.claimROI();
+
+        // 🚨 Withdraw from Airdrop Vault (True flag)
+        vm.prank(user2);
+        mining.withdraw(10 * 1e18, true); 
+
+        // Warp another 28 days (Cycle 2 finishes)
+        vm.warp(mining.launchTime() + 84 days);
         (, uint256 airdropPendingAfter) = mining.getPendingROI(user2);
         assertEq(airdropPendingAfter, 0, "Airdrop ROI should permanently halt after withdrawal");
     }
@@ -133,9 +158,9 @@ contract HMTMiningForkTest is Test {
         vm.warp(block.timestamp + 24 hours);
         vm.prank(user4);
         mining.claimROI();
-        (,,,,,,,,,,,,,,,,, uint256 u1Vault, ) = mining.users(user1);
-        (,,,,,,,,,,,,,,,,, uint256 u2Vault, ) = mining.users(user2);
-        (,,,,,,,,,,,,,,,,, uint256 u3Vault, ) = mining.users(user3);
+        (,,,,,,,,,,,,,,,,, uint256 u1Vault,, ) = mining.users(user1);
+        (,,,,,,,,,,,,,,,,, uint256 u2Vault,, ) = mining.users(user2);
+        (,,,,,,,,,,,,,,,,, uint256 u3Vault,, ) = mining.users(user3);
 
         assertEq(u3Vault, 0.9 * 1e18, "User3 should get 15% Level 1 Income");
         assertEq(u2Vault, 0.6 * 1e18, "User2 should get 10% Level 2 Income");
@@ -152,7 +177,8 @@ contract HMTMiningForkTest is Test {
         uint256 initialOwnerBalance = IERC20(BSC_USDT).balanceOf(ownerWallet);
 
         vm.prank(user1);
-        mining.withdraw(5 * 1e18);
+        mining.withdraw(5 * 1e18, false); // 🟢 `false` specifies Regular Vault
+
         uint256 finalUserBalance = IERC20(BSC_USDT).balanceOf(user1);
         uint256 finalOwnerBalance = IERC20(BSC_USDT).balanceOf(ownerWallet);
         

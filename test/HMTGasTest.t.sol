@@ -68,7 +68,7 @@ contract HMTGasTest is Test {
         IERC20(BSC_USDT).approve(address(mining), type(uint256).max);
 
         uint256 gasBeforeInvest = gasleft();
-        mining.invest(company, 100 * 1e18, false);
+        mining.invest(company, 100 * 1e18, false); // boolean parameter unchanged for testing
         uint256 gasUsedInvest = gasBeforeInvest - gasleft();
         
         console.log("-----------------------------------------");
@@ -84,10 +84,11 @@ contract HMTGasTest is Test {
 
         vm.warp(block.timestamp + 10 days);
 
-        uint256 available = mining.getTotalWithdrawable(normalUser);
+        // 🟢 UPDATED: Unpacks dual-vault return tuple
+        (uint256 available, ) = mining.getTotalWithdrawable(normalUser);
         
         uint256 gasBeforeWithdraw = gasleft();
-        mining.withdraw(available);
+        mining.withdraw(available, false); // 🟢 UPDATED: Requires boolean parameter
         uint256 gasUsedWithdraw = gasBeforeWithdraw - gasleft();
         
         console.log(" GAS USED FOR WITHDRAWAL:   ", gasUsedWithdraw);

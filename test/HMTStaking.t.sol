@@ -41,7 +41,7 @@ contract HMTStakingTest is Test {
         nft = new MockNFT();
         mining = new HMTMining(BSC_USDT, address(hmt), PANCAKESWAP_ROUTER, company, ownerWallet, address(nft));
         hmt.setMiningContract(address(mining));
-
+        
         // Fund treasury to pay out rewards
         hmt.transfer(address(mining), 5_000_000 * 1e18);
     }
@@ -57,29 +57,28 @@ contract HMTStakingTest is Test {
         mining.stakeHMTTokens(1000 * 1e18);
         vm.stopPrank();
 
-        // 1. Warp 10 Days Forward
+        // 1. Warp 10 Days Forward (Cycle 0)
         vm.warp(block.timestamp + 10 days);
         
         (uint256 gross, uint256 penalty, uint256 net) = mining.getStakingOverview(staker);
         
-        // 1000 * (1.006)^10 = ~1061.64
-        // Because it's < 30 days, penalty is 15% of 1061.64 = ~159.24
-        // Net = ~902.40 (User loses money for unstaking early!)
+        // 1000 * (1.002)^30 = ~1061.75
+        // Because it's < 28 days (Cycle 1), penalty is 20%
         assertTrue(gross > 1060 * 1e18 && gross < 1062 * 1e18, "Compound logic failed for 10 days");
-        assertTrue(penalty > 150 * 1e18, "15% Penalty not applied");
+        assertTrue(penalty > 210 * 1e18, "20% Penalty not applied correctly");
         assertTrue(net < 1000 * 1e18, "Net should be a loss if unstaked early");
 
-        // 2. Warp 181 Days Forward (Passes 6 month lock)
-        vm.warp(block.timestamp + 171 days); // 10 + 171 = 181 total days
+        // 2. Warp 158 Days Forward (10 + 158 = 168 total days = Exactly 6 Cycles)
+        vm.warp(block.timestamp + 158 days); 
         
         (uint256 finalGross, uint256 finalPenalty, uint256 finalNet) = mining.getStakingOverview(staker);
         
-        // At 181 days, penalty must be exactly 0%
-        assertEq(finalPenalty, 0, "Penalty not reduced to 0% after 6 months");
+        // At exactly 6 cycles (168 days), penalty must drop to 0%
+        assertEq(finalPenalty, 0, "Penalty not reduced to 0% after 6 cycles (168 days)");
         assertEq(finalNet, finalGross, "Net and Gross must match exactly");
         
-        // 1000 * (1.006)^181 = ~2953.50
-        assertTrue(finalNet > 2950 * 1e18, "6-Month Yield Calculation Failed");
+        // 1000 * (1.002)^504 intervals = ~2735.50
+        assertTrue(finalNet > 2730 * 1e18, "6-Cycle Yield Calculation Failed");
 
         // 3. User claims
         vm.prank(staker);

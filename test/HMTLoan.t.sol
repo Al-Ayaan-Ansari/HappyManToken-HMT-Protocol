@@ -66,18 +66,13 @@ contract HMTLoanTest is Test {
     function _crashHMTPrice() internal {
         vm.startPrank(whale);
         hmt.approve(PANCAKESWAP_ROUTER, type(uint256).max);
-        
         address[] memory path = new address[](2);
         path[0] = address(hmt);
         path[1] = BSC_USDT;
-
         IPancakeRouter02Test(PANCAKESWAP_ROUTER).swapExactTokensForTokens(
             1_500_000 * 1e18, 0, path, whale, block.timestamp + 1000
         );
         vm.stopPrank();
-
-        uint256 newPrice = hmt.getUSDTForHMT(1e18);
-        console.log("CRASH: New HMT Price is: ", newPrice / 1e18, " USDT");
     }
 
     function test_Loan_TakingLoanWorksAndEnforcesLTV() public {
@@ -95,13 +90,12 @@ contract HMTLoanTest is Test {
         
         uint256 usdtBalanceAfter = IERC20(BSC_USDT).balanceOf(borrower);
         assertEq(usdtBalanceAfter - usdtBalanceBefore, expectedLoanAmt, "Did not receive exactly 50% LTV in USDT");
-
+        
         (uint256 colHMT, uint256 loanAmt, uint256 initVal, , bool isActive) = mining.userLoans(borrower);
         assertTrue(isActive, "Loan not marked active");
         assertEq(colHMT, 1000 * 1e18, "Collateral not tracked");
         assertEq(loanAmt, expectedLoanAmt, "Loan amount not tracked");
         assertEq(initVal, expectedCollateralValue, "Initial value not tracked");
-        
         assertEq(mining.activeLoanUsers(0), borrower, "Not added to active loop array");
         vm.stopPrank();
     }
@@ -112,10 +106,9 @@ contract HMTLoanTest is Test {
 
         vm.startPrank(borrower);
         hmt.approve(address(mining), 2000 * 1e18);
-        
         mining.takeLoan(1000 * 1e18); 
 
-        vm.expectRevert("Must repay existing loan before taking another");
+        vm.expectRevert(abi.encodeWithSignature("LoanActive()"));
         mining.takeLoan(1000 * 1e18); 
         vm.stopPrank();
     }
@@ -127,27 +120,57 @@ contract HMTLoanTest is Test {
         vm.startPrank(borrower);
         hmt.approve(address(mining), 1000 * 1e18);
         
-        uint256 expectedCollateralValue = hmt.getUSDTForHMT(1000 * 1e18);
-        uint256 expectedLoanAmt = (expectedCollateralValue * 50) / 100;
+        uint256 expectedCollateralValue = hmt.getUSDTForHMT(1000 * 1e18); // ~ $1000
+        uint256 expectedLoanAmt = (expectedCollateralValue * 50) / 100;   // ~ $500
 
         mining.takeLoan(1000 * 1e18); 
         vm.stopPrank();
 
         (,,, uint256 actualStartTime, ) = mining.userLoans(borrower);
-
+        
+        // Day 0: 10% of INITIAL VALUE ($1000 * 10% = $100). Total Debt = $600.
         uint256 dayZeroDebt = mining.getLoanDebt(borrower);
-        uint256 expectedDayZero = expectedLoanAmt + ((expectedLoanAmt * 10) / 100);
-        assertEq(dayZeroDebt, expectedDayZero, "Upfront 10% interest failed");
+        uint256 expectedDayZero = expectedLoanAmt + ((expectedCollateralValue * 10) / 100);
+        assertEq(dayZeroDebt, expectedDayZero, "Upfront 10% interest on whole amount failed");
+        
+        // Cycle 1 (Day 28): Another 10% of INITIAL VALUE. Total Debt = $700.
+        vm.warp(actualStartTime + 28 days);
+        uint256 day28Debt = mining.getLoanDebt(borrower);
+        uint256 expectedDay28 = expectedLoanAmt + ((expectedCollateralValue * 20) / 100);
+        assertEq(day28Debt, expectedDay28, "Cycle 1 interest failed");
 
-        vm.warp(actualStartTime + 30 days);
-        uint256 dayThirtyDebt = mining.getLoanDebt(borrower);
-        uint256 expectedDayThirty = expectedLoanAmt + ((expectedLoanAmt * 20) / 100);
-        assertEq(dayThirtyDebt, expectedDayThirty, "Month 1 interest failed");
+        // Cycle 2 (Day 56): Another 10% of INITIAL VALUE. Total Debt = $800.
+        vm.warp(actualStartTime + 56 days);
+        uint256 day56Debt = mining.getLoanDebt(borrower);
+        uint256 expectedDay56 = expectedLoanAmt + ((expectedCollateralValue * 30) / 100);
+        assertEq(day56Debt, expectedDay56, "Cycle 2 interest failed");
+    }
 
-        vm.warp(actualStartTime + 60 days);
-        uint256 daySixtyDebt = mining.getLoanDebt(borrower);
-        uint256 expectedDaySixty = expectedLoanAmt + ((expectedLoanAmt * 30) / 100);
-        assertEq(daySixtyDebt, expectedDaySixty, "Month 2 interest failed");
+    // 🟢 NEW: Hard Liquidation Test
+    function test_Loan_HardLiquidationAfterThreeCycles() public {
+        address borrower = address(dummyNonce + 999);
+        hmt.transfer(borrower, 1000 * 1e18); 
+
+        vm.startPrank(borrower);
+        hmt.approve(address(mining), 1000 * 1e18);
+        mining.takeLoan(1000 * 1e18); 
+        vm.stopPrank();
+
+        // Ensure price is completely healthy and borrower is safe on Day 1
+        assertFalse(mining.isLiquidatable(borrower), "Should not be liquidatable yet");
+
+        // Warp exactly 84 days (3 full cycles = enters 4th cycle)
+        vm.warp(block.timestamp + 84 days);
+
+        // Borrower is now instantly liquidatable due to time limit, even though price didn't drop!
+        assertTrue(mining.isLiquidatable(borrower), "Time-based liquidation failed");
+
+        // Liquidate
+        mining.liquidateLoan(borrower);
+
+        (uint256 colHMT,,,, bool isActive) = mining.userLoans(borrower);
+        assertFalse(isActive, "Loan was not wiped out");
+        assertEq(colHMT, 0, "Struct not deleted");
     }
 
     function test_Loan_RepayingLoanUnlocksCollateral() public {
@@ -158,8 +181,8 @@ contract HMTLoanTest is Test {
         hmt.approve(address(mining), 1000 * 1e18);
         mining.takeLoan(1000 * 1e18);
         
-        deal(BSC_USDT, borrower, 600 * 1e18);
-        IERC20(BSC_USDT).approve(address(mining), 600 * 1e18);
+        deal(BSC_USDT, borrower, 1000 * 1e18); // Give enough to cover the new higher interest
+        IERC20(BSC_USDT).approve(address(mining), type(uint256).max);
 
         mining.repayLoan();
         vm.stopPrank();
@@ -189,8 +212,8 @@ contract HMTLoanTest is Test {
         vm.stopPrank();
 
         assertFalse(mining.isLiquidatable(borrower), "Should not be liquidatable yet");
-
-        vm.expectRevert("Collateral is healthy, cannot liquidate");
+        
+        vm.expectRevert(abi.encodeWithSignature("HealthyCollateral()"));
         mining.liquidateLoan(borrower);
 
         _crashHMTPrice();
@@ -198,7 +221,7 @@ contract HMTLoanTest is Test {
         assertTrue(mining.isLiquidatable(borrower), "Oracle did not flag loan for liquidation");
 
         mining.liquidateLoan(borrower);
-
+        
         (uint256 colHMT,,,, bool isActive) = mining.userLoans(borrower);
         assertFalse(isActive, "Loan was not wiped out");
         assertEq(colHMT, 0, "Struct not deleted");
@@ -209,6 +232,7 @@ contract HMTLoanTest is Test {
 
     function test_Loan_BatchAndAutoCranks() public {
         address[] memory borrowers = new address[](5);
+        
         for(uint160 i = 0; i < 5; i++) {
             borrowers[i] = address(dummyNonce + 200 + i);
             hmt.transfer(borrowers[i], 1000 * 1e18); 
@@ -220,7 +244,6 @@ contract HMTLoanTest is Test {
         }
 
         _crashHMTPrice();
-
         mining.batchLiquidate(3);
 
         vm.expectRevert();
@@ -230,54 +253,13 @@ contract HMTLoanTest is Test {
         deal(BSC_USDT, user6, 2500 * 1e18);
         vm.startPrank(user6);
         IERC20(BSC_USDT).approve(address(mining), type(uint256).max);
-        
         mining.invest(company, 100 * 1e18, false);
         vm.stopPrank();
 
         vm.expectRevert(); 
         mining.activeLoanUsers(0);
-
+        
         (,,,, bool active) = mining.userLoans(borrowers[0]);
         assertFalse(active, "Auto-crank failed to liquidate remaining users");
-    }
-
-    function test_OTC_SwapHMTForUSDT() public {
-        address swapper = address(dummyNonce + 300);
-        uint256 hmtToSwap = 1000 * 1e18;
-        hmt.transfer(swapper, hmtToSwap);
-
-        uint256 expectedUSDTOut = hmt.getUSDTForHMT(hmtToSwap);
-
-        deal(BSC_USDT, address(mining), 50_000 * 1e18);
-
-        uint256 userUSDTBefore = IERC20(BSC_USDT).balanceOf(swapper);
-        uint256 contractHMTBefore = hmt.balanceOf(address(mining));
-
-        vm.startPrank(swapper);
-        hmt.approve(address(mining), hmtToSwap);
-        mining.swapHMTForUSDT(hmtToSwap);
-        vm.stopPrank();
-
-        uint256 userUSDTAfter = IERC20(BSC_USDT).balanceOf(swapper);
-        uint256 contractHMTAfter = hmt.balanceOf(address(mining));
-
-        assertEq(userUSDTAfter - userUSDTBefore, expectedUSDTOut, "User did not receive correct USDT payout");
-        assertEq(contractHMTAfter - contractHMTBefore, hmtToSwap, "Contract did not receive the swapped HMT");
-        assertEq(hmt.balanceOf(swapper), 0, "User's HMT was not fully deducted");
-    }
-
-    function test_OTC_SwapRevertsIfTreasuryEmpty() public {
-        address swapper = address(dummyNonce + 301);
-        uint256 hmtToSwap = 1000 * 1e18;
-        hmt.transfer(swapper, hmtToSwap); 
-
-        deal(BSC_USDT, address(mining), 0);
-
-        vm.startPrank(swapper);
-        hmt.approve(address(mining), hmtToSwap);
-        
-        vm.expectRevert("Insufficient USDT liquidity in protocol");
-        mining.swapHMTForUSDT(hmtToSwap);
-        vm.stopPrank();
     }
 }

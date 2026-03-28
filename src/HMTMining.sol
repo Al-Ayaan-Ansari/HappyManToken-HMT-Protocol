@@ -1,711 +1,448 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+interface IERC20 { function transfer(address,uint256) external returns(bool); function transferFrom(address,address,uint256) external returns(bool); function balanceOf(address) external view returns(uint256); function approve(address,uint256) external returns(bool); }
+interface IERC721 { function ownerOf(uint256) external view returns(address); function transferFrom(address,address,uint256) external; }
+interface IHMTToken is IERC20 { function getHMTForUSDT(uint256) external view returns(uint256); function getUSDTForHMT(uint256) external view returns(uint256); }
+interface IPancakeFactory { function getPair(address,address) external view returns(address); }
+interface IPancakePair { function token0() external view returns(address); function getReserves() external view returns(uint112,uint112,uint32); }
+interface IPancakeRouter02 { function factory() external pure returns(address); function swapExactTokensForTokens(uint256,uint256,address[] calldata,address,uint256) external returns(uint256[] memory); function addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256) external returns(uint256,uint256,uint256); }
+interface INFTContract is IERC721 { function mintRewardNFT(address,uint8) external; function getNFTTier(uint256) external view returns(uint8); function getTierPrice(uint8) external view returns(uint256); }
 
-// ==========================================
-// 🔌 INTERFACES
-// ==========================================
-
-interface IHMTToken is IERC20 {
-    function getHMTForUSDT(uint256 usdtAmount) external view returns (uint256);
-    function getUSDTForHMT(uint256 hmtAmount) external view returns (uint256);
-}
-
-interface IPancakeFactory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
-}
-
-interface IPancakePair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-}
-
-interface IPancakeRouter02 {
-    function factory() external pure returns (address);
-    function swapExactTokensForTokens(uint256 amountIn, uint256 amountOutMin, address[] calldata path, address to, uint256 deadline) external returns (uint256[] memory amounts);
-    function addLiquidity(address tokenA, address tokenB, uint256 amountADesired, uint256 amountBDesired, uint256 amountAMin, uint256 amountBMin, address to, uint256 deadline) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
-}
-
-interface INFTContract is IERC721 {
-    function mintRewardNFT(address to, uint8 tier) external;
-    function getNFTTier(uint256 tokenId) external view returns (uint8);
-    function getTierPrice(uint8 tier) external view returns (uint256);
-}
-
-// ==========================================
-// 🚨 CUSTOM ERRORS
-// ==========================================
+// ── Errors ───────────────────────────────────────────────────────────────────
+error InvalidAmount();
+error InsufficientLiquidity();
+error InsufficientVault();
+error ExceedsDailyLimit();
 error ZeroAddress();
 error AlreadyEntered();
-error NoSmartContracts();
-error LotteryNotReady();
-error PoolResolved();
-error PoolEmpty();
-error PoolFull();
-error NotMature();
-error InvalidAmount();
-error LoanActive();
-error InsufficientLiquidity();
-error NoActiveLoan();
-error Liquidatable();
-error HealthyCollateral();
 error NotOwner();
 error InvalidTier();
 error NotStaked();
-error BelowMinLimit();
-error ExceedsMaxInvest();
 error InvalidSponsor();
-error NoStakes();
-error InsufficientVault();
-error ExceedsDailyLimit();
+error Liquidatable();
+error HealthyCollateral();
 
-// ==========================================
-// 🏗️ MAIN MINING CONTRACT
-// ==========================================
+contract HMTMining {
 
-contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
-    using SafeERC20 for IERC20;
-    using SafeERC20 for IHMTToken;
-    
-    IERC20 public USDT;
-    IHMTToken public HMT;
+    IERC20           public USDT;
+    IHMTToken        public HMT;
     IPancakeRouter02 public pancakeRouter;
-    INFTContract public NFT;
+    INFTContract     public NFT;
 
     address public companyWallet;
     address public ownerWallet;
     uint256 public launchTime;
-    
-    uint256 public constant MIN_INVESTMENT = 2 * 1e18;
-    uint256 public constant MAX_INVESTMENT = 2500 * 1e18;
-    uint16 public constant MAX_DEPTH = 50;
-    uint256 public constant MAX_CLAIM_CYCLES = 24;
-    uint256 public constant CYCLE_DURATION = 28 days;
-    uint256 public constant WEEKLY_MAINTENANCE = 1000 * 1e18;
-    uint256 public constant OWNER_CYCLE_PAYOUT = 21_000 * 1e18; 
-    uint256 public constant MAX_OWNER_PAYOUTS = 100;
 
-    // 🟢 Industry Standard Burn Address for permanent LP locking
+    uint256 public constant MIN_INVESTMENT           = 2e18;
+    uint256 public constant MAX_INVESTMENT           = 2500e18;
+    uint256 public constant MAX_CLAIM_CYCLES         = 24;
+    uint256 public constant CYCLE_DURATION           = 28 days;
+    uint256 public constant WEEKLY_MAINTENANCE       = 1000e18;
+    uint256 public constant OWNER_CYCLE_PAYOUT       = 21_000e18;
+    uint256 public constant MAX_OWNER_PAYOUTS        = 100;
+    uint256 public constant LOTTERY_ENTRY_FEE        = 100e18;
+    uint256 public constant LOTTERY_MAX_PARTICIPANTS = 100;
+    uint256 public constant LOTTERY_MATURITY_TIME    = 45 days;
+    uint256 public constant AUTO_BATCH_SIZE          = 5;
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
-    
-    bool public isPayoutLockedToHMT = false;
+
+    bool    public isPayoutLockedToHMT;
     uint256 public ownerPayoutsClaimed;
 
+    uint256 private _status = 1;
+    modifier nonReentrant() { if (_status == 2) revert AlreadyEntered(); _status = 2; _; _status = 1; }
+    modifier onlyOwner()    { if (msg.sender != ownerWallet) revert NotOwner(); _; }
+
+    // Bools packed with address sponsor (same 32-byte slot); uint96 fills the rest
     struct User {
         address sponsor;
+        bool    isMatrixUnlocked;
+        bool    isTierZeroLocked;
+        bool    hasWithdrawn;
+        uint96  directReferralsCount;
         uint256 registrationTime;
-        uint256 totalInvestment;     
-        uint256 directReferralsCount;
+        uint256 totalInvestment;
         uint256 directsWith3Count;
-        uint256 directsWith9Count;   
-        bool isMatrixUnlocked;       
-        bool isTierZeroLocked;       
-        uint256 totalTeamVolume;     
-        uint256 strongestLegVolume;  
-        address strongestLegUser;    
-        uint256 lastBaseClaimTime;     
-        uint256 baseClaimed;           
-        uint256 lastAirdropCycle; 
+        uint256 directsWith9Count;
+        uint256 totalTeamVolume;
+        uint256 strongestLegVolume;
+        address strongestLegUser;
+        uint256 lastBaseClaimTime;
+        uint256 baseClaimed;
+        uint256 lastAirdropCycle;
         uint256 airdropClaimed;
-        bool hasWithdrawn;             
-        uint256 lastClaimedCycle;    
-        uint256 levelIncomeVault;    
-        uint256 matrixRoyaltyVault;  
-        uint256 airdropVault; 
+        uint256 lastClaimedCycle;
+        uint256 levelIncomeVault;
+        uint256 matrixRoyaltyVault;
+        uint256 airdropVault;
     }
 
-    struct UserMatrix {
-        uint8 currentMatrixTier;
-        mapping(uint8 => uint256) upgradeCycle; 
-    }
-    
-    struct WithdrawWindow {
-        uint256 windowStartTime;
-        uint256 withdrawnAmount;
-        uint256 maxDailyLimit; 
-    }
+    struct UserMatrix      { uint8 currentMatrixTier; mapping(uint8 => uint256) upgradeCycle; }
+    struct WithdrawWindow  { uint256 windowStartTime; uint256 withdrawnAmount; }
+    struct InvestmentWindow{ uint256 windowStartTime; uint256 totalInvested;   }
 
-    struct InvestmentWindow {
-        uint256 windowStartTime;
-        uint256 totalInvested;
-    }
-
-    mapping(address => User) public users;
-    mapping(address => UserMatrix) public userMatrixData;
+    mapping(address => User)             public users;
+    mapping(address => UserMatrix)       public userMatrixData;
     mapping(address => mapping(address => uint256)) public legVolume;
     mapping(address => InvestmentWindow) public userInvestmentWindows;
-    mapping(address => WithdrawWindow) public userWithdrawWindows;
-    
+    mapping(address => WithdrawWindow)   public userWithdrawWindows;
+
     mapping(address => mapping(uint256 => uint256)) public cycleTotalVolume;
     mapping(address => mapping(uint256 => uint256)) public cycleStrongestLegVolume;
     mapping(address => mapping(address => mapping(uint256 => uint256))) public cycleLegVolume;
-    
     mapping(address => mapping(uint256 => uint256)) public weeklyTotalVolume;
     mapping(address => mapping(uint256 => uint256)) public weeklyStrongestLegVolume;
     mapping(address => mapping(address => mapping(uint256 => uint256))) public weeklyLegVolume;
 
-    mapping(address => mapping(uint256 => bool)) public airdropEligible;
+    mapping(address => mapping(uint256 => bool))    public airdropEligible;
+    mapping(address => uint256)                     public lastAirdropUpdate;
+    mapping(address => mapping(uint256 => uint256)) public cycleAirdropEarned;
 
     uint256[10] public totalSharesPerTier;
-    uint256[10] public tierPercentages = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-    mapping(uint256 => mapping(uint8 => uint256)) public cycleRPS; 
+    mapping(uint256 => mapping(uint8 => uint256)) public cycleRPS;
 
     uint256[8] public nftTotalSharesPerTier;
-    uint256[8] public nftTierPercentages = [0, 1, 2, 3, 4, 5, 15, 35];
     mapping(uint256 => mapping(uint8 => uint256)) public cycleNFTRPS;
-    
-    struct StakedNFT {
-        uint8 tier;
-        uint256 startCycle;
-    }
-    mapping(address => uint256[]) public userStakedTokenIds;
+
+    struct StakedNFT  { uint8 tier; uint256 startCycle; }
+    mapping(address => uint256[])  public userStakedTokenIds;
     mapping(uint256 => StakedNFT) public tokenStakingData;
 
-    struct LotteryPool {
-        uint256 startTime;
-        address[] participants;
-        bool isResolved;
-    }
-
-    uint256 public currentLotteryId = 1;
+    struct LotteryPool { uint256 startTime; address[] participants; bool isResolved; }
+    uint256 public currentLotteryId      = 1;
     uint256 public lastResolvedLotteryId = 1;
-    mapping(uint256 => LotteryPool) public lotteryPools;
+    mapping(uint256 => LotteryPool)              public lotteryPools;
     mapping(uint256 => mapping(address => bool)) public poolHasEntered;
 
-    uint256 public constant LOTTERY_ENTRY_FEE = 100 * 1e18; 
-    uint256 public constant LOTTERY_MAX_PARTICIPANTS = 100;
-    uint256 public constant LOTTERY_MATURITY_TIME = 45 days;
-
-    struct Loan {
-        uint256 collateralHMT;
-        uint256 loanAmountUSDT;
-        uint256 initialCollateralValueUSDT;
-        uint256 loanStartTime;
-        bool isActive;
-    }
-    
+    struct Loan { uint256 collateralHMT; uint256 loanAmountUSDT; uint256 initialCollateralValueUSDT; uint256 loanStartTime; bool isActive; }
     mapping(address => Loan) public userLoans;
     address[] public activeLoanUsers;
     mapping(address => uint256) public activeLoanIndex;
+    uint256 public currentLiquidationIndex;
 
-    uint256 public currentLiquidationIndex = 0;
-    uint256 public constant AUTO_BATCH_SIZE = 5;
-
-    struct TokenStake {
-        uint256 amount;
-        uint256 startTime;
-    }
+    struct TokenStake { uint256 amount; uint256 startTime; }
     mapping(address => TokenStake[]) public userTokenStakes;
 
-    event Invested(address indexed user, uint256 amount, bool isTwentyEightyRatio);
-    event FeePaid(address indexed user, uint256 feeAmount);
-    event ROIClaimed(address indexed user, uint256 baseAmount, uint256 airdropAmount);
-    event LevelIncomeDistributed(address indexed sponsor, address indexed downline, uint256 amount, uint8 level);
-    event MatrixUnlocked(address indexed user, bool missedDeadline);
-    event MatrixTierUpgraded(address indexed user, uint8 newTier, uint256 eligibleCycle);
-    event MatrixRoyaltyClaimed(address indexed user, uint256 cyclePayout, uint256 cycleId, bool passedMaintenance);
+    // ── Events ───────────────────────────────────────────────────────────────
+    event Invested(address indexed user, uint256 amount);
+    event MatrixUnlocked(address indexed user);
+    event MatrixRoyaltySettled(address indexed user, uint256 totalPayout);
     event Withdrawn(address indexed user, uint256 amount, bool paidInHMT);
-    event AirdropForfeited(address indexed user);
-    event OwnerPayoutProcessed(address indexed ownerWallet, uint256 amount, uint256 totalCyclesClaimed);
-    event NFTStaked(address indexed user, uint256 tokenId, uint8 tier);
-    event NFTUnstaked(address indexed user, uint256 tokenId);
-    event NFTRewardsClaimed(address indexed user, uint256 amount);
     event LotteryEntered(address indexed user, uint256 poolId);
     event LotteryResolved(uint256 indexed poolId);
     event LoanTaken(address indexed user, uint256 collateralHMT, uint256 loanUSDT);
-    event LoanRepaid(address indexed user, uint256 debtPaidUSDT, uint256 collateralReturnedHMT);
-    event LoanLiquidated(address indexed user, uint256 collateralSeizedHMT, uint256 defaultedDebtUSDT);
-    event HMTSwappedForUSDT(address indexed user, uint256 hmtIn, uint256 usdtOut);
-    event TokensStaked(address indexed user, uint256 amount, uint256 stakeIndex);
-    event AllTokensUnstaked(address indexed user, uint256 totalPayout, uint256 totalPenalty);
-    event LiquidityAutoBalanced(address indexed triggerer, uint256 hmtAdded, uint256 usdtAdded);
+    event LoanRepaid(address indexed user, uint256 debt, uint256 collateral);
+    event LoanLiquidated(address indexed user, uint256 collateral);
 
-    constructor(
-        address _usdt, address _hmt, address _router, address _companyWallet, address _ownerWallet, address _nftContract
-    ) Ownable(msg.sender) {
+    // ── Constructor ──────────────────────────────────────────────────────────
+    constructor(address _usdt, address _hmt, address _router, address _companyWallet, address _ownerWallet, address _nftContract) {
         if (_companyWallet == address(0) || _ownerWallet == address(0)) revert ZeroAddress();
-        
         USDT = IERC20(_usdt); HMT = IHMTToken(_hmt); pancakeRouter = IPancakeRouter02(_router);
         companyWallet = _companyWallet; ownerWallet = _ownerWallet; NFT = INFTContract(_nftContract);
         launchTime = block.timestamp;
-        
-        users[companyWallet].totalInvestment = 10000 * 1e18; 
-        users[companyWallet].registrationTime = block.timestamp;
-        users[companyWallet].isMatrixUnlocked = true;
-        users[companyWallet].lastClaimedCycle = 0;
+        User storage cw = users[companyWallet];
+        cw.totalInvestment  = 10000e18;
+        cw.registrationTime = block.timestamp;
+        cw.isMatrixUnlocked = true;
     }
 
-    function onERC721Received(address, address, uint256, bytes calldata) external pure override returns (bytes4) {
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        ownerWallet = newOwner;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
         return this.onERC721Received.selector;
     }
 
+    // ── Pure tier helpers (replaces storage arrays — zero SLOAD) ─────────────
+    function _tierPct(uint8 i) internal pure returns (uint256) { return uint256(i) + 1; }
+    function _nftTierPct(uint8 i) internal pure returns (uint256) {
+        if (i == 0) return 0;
+        if (i <= 5) return uint256(i);
+        return i == 6 ? 15 : 35;
+    }
+
+    // ── Global checkpoint orchestrator ───────────────────────────────────────
+    function _runGlobalCheckpoints(address _user) internal {
+        _processOwnerPayout();
+        _autoLiquidateChunk();
+        if (users[_user].totalInvestment > 0) {
+            _internalClaimROI(_user);
+            _internalClaimMatrixRoyalty(_user);
+            _internalClaimNFTRewards(_user);
+        }
+    }
+
+    // ── Owner payout ─────────────────────────────────────────────────────────
     function _processOwnerPayout() internal {
-        if (ownerPayoutsClaimed >= MAX_OWNER_PAYOUTS) return;
-        uint256 cyclesPassed = (block.timestamp - launchTime) / CYCLE_DURATION;
-        if (cyclesPassed > ownerPayoutsClaimed) {
-            uint256 pendingPayouts = cyclesPassed - ownerPayoutsClaimed;
-            if (ownerPayoutsClaimed + pendingPayouts > MAX_OWNER_PAYOUTS) {
-                pendingPayouts = MAX_OWNER_PAYOUTS - ownerPayoutsClaimed;
-            }
-            if (pendingPayouts > 0) {
-                uint256 payoutAmount = pendingPayouts * OWNER_CYCLE_PAYOUT;
-                if (HMT.balanceOf(address(this)) >= payoutAmount) {
-                    ownerPayoutsClaimed += pendingPayouts;
-                    HMT.safeTransfer(ownerWallet, payoutAmount);
-                    emit OwnerPayoutProcessed(ownerWallet, payoutAmount, ownerPayoutsClaimed);
-                }
-            }
+        uint256 claimed = ownerPayoutsClaimed;
+        if (claimed >= MAX_OWNER_PAYOUTS) return;
+        uint256 passed = (block.timestamp - launchTime) / CYCLE_DURATION;
+        if (passed <= claimed) return;
+        uint256 pending = passed - claimed;
+        if (claimed + pending > MAX_OWNER_PAYOUTS) pending = MAX_OWNER_PAYOUTS - claimed;
+        uint256 amt = pending * OWNER_CYCLE_PAYOUT;
+        if (HMT.balanceOf(address(this)) >= amt) {
+            ownerPayoutsClaimed = claimed + pending;
+            HMT.transfer(ownerWallet, amt);
         }
     }
 
-    // ==========================================
-    // 🌊 AUTO-BALANCE PROTOCOL LIQUIDITY
-    // ==========================================
-
+    // ── Liquidity ─────────────────────────────────────────────────────────────
     function autoBalanceLiquidity() external nonReentrant {
-        address factory = pancakeRouter.factory();
-        address pair = IPancakeFactory(factory).getPair(address(HMT), address(USDT));
-        require(pair != address(0), "Liquidity pair not created");
-
-        uint256 hmtReserve;
-        address token0 = IPancakePair(pair).token0();
-        (uint112 reserve0, uint112 reserve1, ) = IPancakePair(pair).getReserves();
-        
-        if (token0 == address(HMT)) {
-            hmtReserve = reserve0;
-        } else {
-            hmtReserve = reserve1;
-        }
-
-        // Trigger condition: HMT capacity in pool is strictly below 600 HMT
-        uint256 threshold = 600 * 1e18;
-        require(hmtReserve < threshold, "HMT capacity is above 60%");
-
-        uint256 hmtToAdd = 1000 * 1e18;
-        uint256 usdtRequired = HMT.getUSDTForHMT(hmtToAdd);
-
-        require(HMT.balanceOf(address(this)) >= hmtToAdd, "Insufficient HMT in Treasury");
-        require(USDT.balanceOf(address(this)) >= usdtRequired, "Insufficient USDT in Treasury");
-
-        HMT.approve(address(pancakeRouter), hmtToAdd);
-        USDT.approve(address(pancakeRouter), usdtRequired);
-
-        pancakeRouter.addLiquidity(
-            address(HMT),
-            address(USDT),
-            hmtToAdd,
-            usdtRequired,
-            0,
-            0,
-            DEAD_ADDRESS, // 🟢 UPDATED: LP tokens are permanently burned (sent to 0x...dead)
-            block.timestamp + 300
-        );
-        
-        emit LiquidityAutoBalanced(msg.sender, hmtToAdd, usdtRequired);
+        IPancakePair pair = IPancakePair(IPancakeFactory(pancakeRouter.factory()).getPair(address(HMT), address(USDT)));
+        if (address(pair) == address(0)) revert InsufficientLiquidity();
+        (uint112 r0, uint112 r1,) = pair.getReserves();
+        bool hmtIs0  = pair.token0() == address(HMT);
+        uint256 hmtRes  = hmtIs0 ? r0 : r1;
+        uint256 usdtRes = hmtIs0 ? r1 : r0;
+        if (hmtRes >= 600e18) revert InsufficientLiquidity();
+        uint256 hToAdd = 1000e18;
+        uint256 uReq   = (hToAdd * usdtRes) / hmtRes;
+        if (HMT.balanceOf(address(this))  < hToAdd) revert InsufficientLiquidity();
+        if (USDT.balanceOf(address(this)) < uReq)   revert InsufficientLiquidity();
+        HMT.approve(address(pancakeRouter), hToAdd);
+        USDT.approve(address(pancakeRouter), uReq);
+        pancakeRouter.addLiquidity(address(HMT), address(USDT), hToAdd, uReq, 0, 0, DEAD_ADDRESS, block.timestamp + 300);
     }
 
-    // ==========================================
-    // 🎲 ISOLATED LOTTERY SYSTEM
-    // ==========================================
-
+    // ── Lottery ───────────────────────────────────────────────────────────────
     function enterLottery() external nonReentrant {
-        if (poolHasEntered[currentLotteryId][msg.sender]) revert AlreadyEntered();
-        LotteryPool storage currentPool = lotteryPools[currentLotteryId];
-        
-        USDT.safeTransferFrom(msg.sender, address(this), LOTTERY_ENTRY_FEE);
-
-        if (currentPool.participants.length == 0) {
-            currentPool.startTime = block.timestamp;
-        }
-
-        poolHasEntered[currentLotteryId][msg.sender] = true;
-        currentPool.participants.push(msg.sender);
-        
-        emit LotteryEntered(msg.sender, currentLotteryId);
-        if (currentPool.participants.length == LOTTERY_MAX_PARTICIPANTS) {
-            currentLotteryId++;
-        }
+        uint256 pid = currentLotteryId;
+        if (poolHasEntered[pid][msg.sender]) revert AlreadyEntered();
+        USDT.transferFrom(msg.sender, address(this), LOTTERY_ENTRY_FEE);
+        LotteryPool storage p = lotteryPools[pid];
+        if (p.participants.length == 0) p.startTime = block.timestamp;
+        poolHasEntered[pid][msg.sender] = true;
+        p.participants.push(msg.sender);
+        emit LotteryEntered(msg.sender, pid);
+        if (p.participants.length == LOTTERY_MAX_PARTICIPANTS) currentLotteryId = pid + 1;
         _autoResolveLottery();
     }
 
     function _autoResolveLottery() internal returns (bool) {
-        uint256 poolId = lastResolvedLotteryId;
-        LotteryPool storage pool = lotteryPools[poolId];
-        
-        if (pool.isResolved || pool.participants.length < LOTTERY_MAX_PARTICIPANTS || block.timestamp < pool.startTime + LOTTERY_MATURITY_TIME) {
-            return false;
-        }
-
-        uint256 hmt400 = HMT.getHMTForUSDT(400 * 1e18);
-        uint256 hmt200 = HMT.getHMTForUSDT(200 * 1e18);
-        uint256 hmt150 = HMT.getHMTForUSDT(150 * 1e18);
-        uint256 hmt100 = HMT.getHMTForUSDT(100 * 1e18);
-
-        uint256 totalRequired = (hmt400 * 5) + (hmt200 * 5) + (hmt150 * 40) + (hmt100 * 50);
-        if (HMT.balanceOf(address(this)) < totalRequired) {
-            return false; 
-        }
-
-        pool.isResolved = true;
-        address[] memory memParticipants = pool.participants;
-        uint256 random = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender, poolId)));
-
+        uint256 pId = lastResolvedLotteryId;
+        LotteryPool storage p = lotteryPools[pId];
+        if (p.isResolved || p.participants.length < LOTTERY_MAX_PARTICIPANTS || block.timestamp < p.startTime + LOTTERY_MATURITY_TIME) return false;
+        uint256 baseRate = HMT.getHMTForUSDT(1e18);
+        if (HMT.balanceOf(address(this)) < baseRate * 14000) return false;
+        p.isResolved = true;
+        address[] memory mem = p.participants;
+        uint256 rand = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, msg.sender, pId)));
         for (uint256 i = LOTTERY_MAX_PARTICIPANTS - 1; i > 0; i--) {
-            random = uint256(keccak256(abi.encodePacked(random))); 
-            uint256 j = random % (i + 1);
-            
-            address temp = memParticipants[i];
-            memParticipants[i] = memParticipants[j];
-            memParticipants[j] = temp;
+            rand = uint256(keccak256(abi.encodePacked(rand)));
+            uint256 j = rand % (i + 1);
+            address tmp = mem[i]; mem[i] = mem[j]; mem[j] = tmp;
         }
-
-        for (uint256 i = 0; i < LOTTERY_MAX_PARTICIPANTS; i++) {
-            address winner = memParticipants[i];
-            uint256 rewardAmount;
-
-            if (i < 5) rewardAmount = hmt400;             
-            else if (i < 10) rewardAmount = hmt200;       
-            else if (i < 50) rewardAmount = hmt150;       
-            else rewardAmount = hmt100;                   
-
-            HMT.safeTransfer(winner, rewardAmount); 
+        for (uint256 i; i < LOTTERY_MAX_PARTICIPANTS; i++) {
+            uint256 mult = i < 5 ? 400 : (i < 10 ? 200 : (i < 50 ? 150 : 100));
+            HMT.transfer(mem[i], baseRate * mult);
         }
-
-        lastResolvedLotteryId++;
-        emit LotteryResolved(poolId);
+        lastResolvedLotteryId = pId + 1;
+        emit LotteryResolved(pId);
         return true;
     }
 
-    function resolveReadyLottery() external nonReentrant {
-        if (msg.sender == tx.origin) revert NoSmartContracts();
-        if (!_autoResolveLottery()) revert LotteryNotReady();
+    function resolveUnclaimedLottery(uint256 _pId) external nonReentrant {
+        LotteryPool storage p = lotteryPools[_pId];
+        if (p.isResolved || p.participants.length == 0)                    revert InvalidAmount();
+        if (p.participants.length >= LOTTERY_MAX_PARTICIPANTS)              revert InvalidAmount();
+        if (block.timestamp < p.startTime + LOTTERY_MATURITY_TIME)         revert InvalidAmount();
+        p.isResolved = true;
+        uint256 len = p.participants.length;
+        for (uint256 i; i < len; i++) USDT.transfer(p.participants[i], LOTTERY_ENTRY_FEE);
+        if (_pId == currentLotteryId)      currentLotteryId++;
+        if (_pId == lastResolvedLotteryId) lastResolvedLotteryId++;
+        emit LotteryResolved(_pId);
     }
 
-    function resolveUnclaimedLottery(uint256 _poolId) external nonReentrant {
-        LotteryPool storage pool = lotteryPools[_poolId];
-        
-        if (pool.isResolved) revert PoolResolved();
-        if (pool.participants.length == 0) revert PoolEmpty();
-        if (pool.participants.length >= LOTTERY_MAX_PARTICIPANTS) revert PoolFull();
-        if (block.timestamp < pool.startTime + LOTTERY_MATURITY_TIME) revert NotMature();
-
-        pool.isResolved = true;
-
-        for(uint256 i = 0; i < pool.participants.length; i++) {
-            USDT.safeTransfer(pool.participants[i], LOTTERY_ENTRY_FEE);
-        }
-
-        if (_poolId == currentLotteryId) {
-            currentLotteryId++;
-        }
-        if (_poolId == lastResolvedLotteryId) {
-            lastResolvedLotteryId++;
-        }
-        
-        emit LotteryResolved(_poolId);
-    }
-
-    // ==========================================
-    // 🏦 HMT COLLATERALIZED LOAN ENGINE
-    // ==========================================
-
+    // ── Loans ─────────────────────────────────────────────────────────────────
     function _removeActiveLoanUser(address _user) internal {
-        uint256 index = activeLoanIndex[_user];
-        uint256 lastIndex = activeLoanUsers.length - 1;
-
-        if (index != lastIndex) {
-            address lastUser = activeLoanUsers[lastIndex];
-            activeLoanUsers[index] = lastUser;
-            activeLoanIndex[lastUser] = index;
+        uint256 idx  = activeLoanIndex[_user];
+        uint256 last = activeLoanUsers.length - 1;
+        if (idx != last) {
+            address lastUsr = activeLoanUsers[last];
+            activeLoanUsers[idx] = lastUsr;
+            activeLoanIndex[lastUsr] = idx;
         }
         activeLoanUsers.pop();
         delete activeLoanIndex[_user];
     }
 
-    function getLoanDebt(address _user) public view returns (uint256) {
-        Loan memory loan = userLoans[_user];
-        if (!loan.isActive) return 0;
-
-        uint256 monthsPassed = (block.timestamp - loan.loanStartTime) / 30 days;
-        uint256 interestIntervals = 1 + monthsPassed;
-        uint256 interestAmount = (loan.loanAmountUSDT * 10 * interestIntervals) / 100;
-        return loan.loanAmountUSDT + interestAmount;
+    function getLoanDebt(address _u) public view returns (uint256) {
+        Loan memory ln = userLoans[_u];
+        if (!ln.isActive) return 0;
+        return ln.loanAmountUSDT + ((ln.initialCollateralValueUSDT * 10 * (1 + ((block.timestamp - ln.loanStartTime) / CYCLE_DURATION))) / 100);
     }
 
-    function isLiquidatable(address _user) public view returns (bool) {
-        Loan memory loan = userLoans[_user];
-        if (!loan.isActive) return false;
-
-        uint256 currentCollateralValueUSDT = HMT.getUSDTForHMT(loan.collateralHMT);
-        uint256 liquidationThreshold = (loan.initialCollateralValueUSDT * 75) / 100;
-
-        return currentCollateralValueUSDT < liquidationThreshold;
+    function isLiquidatable(address _u) public view returns (bool) {
+        Loan memory ln = userLoans[_u];
+        if (!ln.isActive) return false;
+        if (block.timestamp >= ln.loanStartTime + 3 * CYCLE_DURATION) return true;
+        return HMT.getUSDTForHMT(ln.collateralHMT) < (ln.initialCollateralValueUSDT * 75) / 100;
     }
 
     function _autoLiquidateChunk() internal {
-        uint256 length = activeLoanUsers.length;
-        if (length == 0) return;
-
-        uint256 checks = 0;
-        while (checks < AUTO_BATCH_SIZE && activeLoanUsers.length > 0) {
-            if (currentLiquidationIndex >= activeLoanUsers.length) {
-                currentLiquidationIndex = 0;
-            }
-
-            address borrower = activeLoanUsers[currentLiquidationIndex];
-            if (isLiquidatable(borrower)) {
-                Loan storage loan = userLoans[borrower];
-                uint256 seizedCollateral = loan.collateralHMT;
-                uint256 defaultedDebt = getLoanDebt(borrower);
-
-                delete userLoans[borrower];
-                _removeActiveLoanUser(borrower);
-
-                emit LoanLiquidated(borrower, seizedCollateral, defaultedDebt);
-            } else {
-                currentLiquidationIndex++;
-            }
-            checks++;
+        if (activeLoanUsers.length == 0) return;
+        for (uint256 checks; checks < AUTO_BATCH_SIZE && activeLoanUsers.length > 0; checks++) {
+            if (currentLiquidationIndex >= activeLoanUsers.length) currentLiquidationIndex = 0;
+            address b = activeLoanUsers[currentLiquidationIndex];
+            if (isLiquidatable(b)) {
+                uint256 col = userLoans[b].collateralHMT;
+                delete userLoans[b];
+                _removeActiveLoanUser(b);
+                emit LoanLiquidated(b, col);
+            } else { currentLiquidationIndex++; }
         }
     }
 
-    function takeLoan(uint256 _hmtAmount) external nonReentrant {
-        if (_hmtAmount == 0) revert InvalidAmount();
-        if (userLoans[msg.sender].isActive) revert LoanActive();
-
-        uint256 collateralValueUSDT = HMT.getUSDTForHMT(_hmtAmount);
-        uint256 loanAmountUSDT = (collateralValueUSDT * 50) / 100;
-        
-        if (USDT.balanceOf(address(this)) < loanAmountUSDT) revert InsufficientLiquidity();
-
-        HMT.safeTransferFrom(msg.sender, address(this), _hmtAmount);
-        USDT.safeTransfer(msg.sender, loanAmountUSDT);
-        userLoans[msg.sender] = Loan({
-            collateralHMT: _hmtAmount,
-            loanAmountUSDT: loanAmountUSDT,
-            initialCollateralValueUSDT: collateralValueUSDT,
-            loanStartTime: block.timestamp,
-            isActive: true
-        });
+    function takeLoan(uint256 _hAmt) external nonReentrant {
+        if (_hAmt == 0 || userLoans[msg.sender].isActive) revert InvalidAmount();
+        uint256 cVal = HMT.getUSDTForHMT(_hAmt);
+        uint256 lAmt = cVal >> 1;
+        if (USDT.balanceOf(address(this)) < lAmt) revert InsufficientLiquidity();
+        HMT.transferFrom(msg.sender, address(this), _hAmt);
+        USDT.transfer(msg.sender, lAmt);
+        userLoans[msg.sender] = Loan({ collateralHMT: _hAmt, loanAmountUSDT: lAmt, initialCollateralValueUSDT: cVal, loanStartTime: block.timestamp, isActive: true });
         activeLoanIndex[msg.sender] = activeLoanUsers.length;
         activeLoanUsers.push(msg.sender);
-
-        emit LoanTaken(msg.sender, _hmtAmount, loanAmountUSDT);
+        emit LoanTaken(msg.sender, _hAmt, lAmt);
     }
 
     function repayLoan() external nonReentrant {
-        Loan storage loan = userLoans[msg.sender];
-        if (!loan.isActive) revert NoActiveLoan();
+        Loan storage ln = userLoans[msg.sender];
+        if (!ln.isActive)               revert InvalidAmount();
         if (isLiquidatable(msg.sender)) revert Liquidatable();
-
-        uint256 totalDebtUSDT = getLoanDebt(msg.sender);
-        uint256 collateralToReturn = loan.collateralHMT;
-        
+        uint256 dbt = getLoanDebt(msg.sender);
+        uint256 col = ln.collateralHMT;
         delete userLoans[msg.sender];
-        _removeActiveLoanUser(msg.sender); 
-
-        USDT.safeTransferFrom(msg.sender, address(this), totalDebtUSDT);
-        HMT.safeTransfer(msg.sender, collateralToReturn);
-
-        emit LoanRepaid(msg.sender, totalDebtUSDT, collateralToReturn);
+        _removeActiveLoanUser(msg.sender);
+        USDT.transferFrom(msg.sender, address(this), dbt);
+        HMT.transfer(msg.sender, col);
+        emit LoanRepaid(msg.sender, dbt, col);
     }
 
-    function liquidateLoan(address _borrower) public nonReentrant {
-        Loan storage loan = userLoans[_borrower];
-        if (!loan.isActive) revert NoActiveLoan();
-        if (!isLiquidatable(_borrower)) revert HealthyCollateral();
-
-        uint256 seizedCollateral = loan.collateralHMT;
-        uint256 defaultedDebt = getLoanDebt(_borrower);
-        delete userLoans[_borrower];
-        _removeActiveLoanUser(_borrower);
-
-        emit LoanLiquidated(_borrower, seizedCollateral, defaultedDebt);
+    function liquidateLoan(address _b) public nonReentrant {
+        if (!userLoans[_b].isActive) revert InvalidAmount();
+        if (!isLiquidatable(_b))     revert HealthyCollateral();
+        uint256 col = userLoans[_b].collateralHMT;
+        delete userLoans[_b];
+        _removeActiveLoanUser(_b);
+        emit LoanLiquidated(_b, col);
     }
 
-    function batchLiquidate(uint256 limit) external nonReentrant {
-        uint256 length = activeLoanUsers.length;
-        uint256 checked = 0;
-
-        for (uint256 i = length; i > 0 && checked < limit; i--) {
-            address borrower = activeLoanUsers[i - 1];
-            if (isLiquidatable(borrower)) {
-                Loan storage loan = userLoans[borrower];
-                uint256 seizedCollateral = loan.collateralHMT;
-                uint256 defaultedDebt = getLoanDebt(borrower);
-
-                delete userLoans[borrower];
-                _removeActiveLoanUser(borrower);
-
-                emit LoanLiquidated(borrower, seizedCollateral, defaultedDebt);
+    function batchLiquidate(uint256 lim) external nonReentrant {
+        for (uint256 i = activeLoanUsers.length; i > 0 && lim > 0; lim--) {
+            i--;
+            address b = activeLoanUsers[i];
+            if (isLiquidatable(b)) {
+                uint256 col = userLoans[b].collateralHMT;
+                delete userLoans[b];
+                _removeActiveLoanUser(b);
+                emit LoanLiquidated(b, col);
             }
-            checked++;
+        }
+    }
+
+    // ── NFT Staking ───────────────────────────────────────────────────────────
+    function stakeNFT(uint256 _tId) external nonReentrant {
+        if (NFT.ownerOf(_tId) != msg.sender) revert NotOwner();
+        uint8 t = NFT.getNFTTier(_tId);
+        if (t < 1 || t > 7) revert InvalidTier();
+        _internalClaimNFTRewards(msg.sender);
+        NFT.transferFrom(msg.sender, address(this), _tId);
+        tokenStakingData[_tId] = StakedNFT(t, (block.timestamp - launchTime) / CYCLE_DURATION + 1);
+        userStakedTokenIds[msg.sender].push(_tId);
+        nftTotalSharesPerTier[t]++;
+    }
+
+    function unstakeNFT(uint256 _tId) external nonReentrant {
+        uint256[] storage ids = userStakedTokenIds[msg.sender];
+        uint256 len  = ids.length;
+        uint256 tIdx = type(uint256).max;
+        for (uint256 i; i < len; i++) { if (ids[i] == _tId) { tIdx = i; break; } }
+        if (tIdx == type(uint256).max) revert NotStaked();
+        _internalClaimNFTRewards(msg.sender);
+        uint8 t = tokenStakingData[_tId].tier;
+        nftTotalSharesPerTier[t]--;
+        ids[tIdx] = ids[len - 1];
+        ids.pop();
+        delete tokenStakingData[_tId];
+        NFT.transferFrom(address(this), msg.sender, _tId);
+    }
+
+    function getPendingNFTRewards(address _user) public view returns (uint256 pend) {
+        uint256 ac  = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256[] memory ids = userStakedTokenIds[_user];
+        for (uint256 i; i < ids.length; i++) {
+            StakedNFT memory s = tokenStakingData[ids[i]];
+            uint256 tp = NFT.getTierPrice(s.tier);
+            for (uint256 c = s.startCycle; c < ac; c++) pend += cycleNFTRPS[c][s.tier] / 1e18 + tp / 100;
         }
     }
 
-    // ==========================================
-    // 🎨 NFT STAKING ENGINE
-    // ==========================================
-
-    function stakeNFT(uint256 _tokenId) external nonReentrant {
-        if (NFT.ownerOf(_tokenId) != msg.sender) revert NotOwner();
-        _internalClaimNFTRewards(msg.sender);
-
-        uint8 tier = NFT.getNFTTier(_tokenId);
-        if (tier < 1 || tier > 7) revert InvalidTier();
-
-        NFT.safeTransferFrom(msg.sender, address(this), _tokenId);
-        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        
-        tokenStakingData[_tokenId] = StakedNFT(tier, currentCycle + 1);
-        userStakedTokenIds[msg.sender].push(_tokenId);
-        nftTotalSharesPerTier[tier]++;
-
-        emit NFTStaked(msg.sender, _tokenId, tier);
-    }
-
-    function unstakeNFT(uint256 _tokenId) external nonReentrant {
-        bool ownsToken = false;
-        uint256 tokenIndex;
-        for (uint i = 0; i < userStakedTokenIds[msg.sender].length; i++) {
-            if (userStakedTokenIds[msg.sender][i] == _tokenId) {
-                ownsToken = true;
-                tokenIndex = i;
-                break;
-            }
-        }
-        if (!ownsToken) revert NotStaked();
-        
-        _internalClaimNFTRewards(msg.sender);
-
-        uint8 tier = tokenStakingData[_tokenId].tier;
-        nftTotalSharesPerTier[tier]--;
-
-        userStakedTokenIds[msg.sender][tokenIndex] = userStakedTokenIds[msg.sender][userStakedTokenIds[msg.sender].length - 1];
-        userStakedTokenIds[msg.sender].pop();
-        delete tokenStakingData[_tokenId];
-
-        NFT.safeTransferFrom(address(this), msg.sender, _tokenId);
-        emit NFTUnstaked(msg.sender, _tokenId);
-    }
-
-    function getPendingNFTRewards(address _user) public view returns (uint256) {
-        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 totalPending = 0;
-
-        for (uint i = 0; i < userStakedTokenIds[_user].length; i++) {
-            uint256 tokenId = userStakedTokenIds[_user][i];
-            StakedNFT memory s = tokenStakingData[tokenId];
-
-            if (actualCycle > s.startCycle) {
-                for (uint256 c = s.startCycle; c < actualCycle; c++) {
-                    totalPending += (cycleNFTRPS[c][s.tier] / 1e18);
-                    uint256 nftPrice = NFT.getTierPrice(s.tier);
-                    totalPending += (nftPrice * 1) / 100;
-                }
-            }
-        }
-        return totalPending;
-    }
-
-    function claimNFTRewards() external nonReentrant {
-        _internalClaimNFTRewards(msg.sender);
-    }
+    function claimNFTRewards() external nonReentrant { _internalClaimNFTRewards(msg.sender); }
 
     function _internalClaimNFTRewards(address _user) internal {
-        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 totalPayout = 0;
-
-        for (uint i = 0; i < userStakedTokenIds[_user].length; i++) {
-            uint256 tokenId = userStakedTokenIds[_user][i];
-            StakedNFT storage s = tokenStakingData[tokenId];
-
-            if (actualCycle > s.startCycle) {
-                for (uint256 c = s.startCycle; c < actualCycle; c++) {
-                    totalPayout += (cycleNFTRPS[c][s.tier] / 1e18);
-                    uint256 nftPrice = NFT.getTierPrice(s.tier);
-                    totalPayout += (nftPrice * 1) / 100;
-                }
-                s.startCycle = actualCycle;
+        uint256 ac  = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256 pay;
+        uint256[] storage ids = userStakedTokenIds[_user];
+        uint256 len = ids.length;
+        for (uint256 i; i < len; i++) {
+            StakedNFT storage s = tokenStakingData[ids[i]];
+            if (ac > s.startCycle) {
+                uint256 tp = NFT.getTierPrice(s.tier);
+                for (uint256 c = s.startCycle; c < ac; c++) pay += cycleNFTRPS[c][s.tier] / 1e18 + tp / 100;
+                s.startCycle = ac;
             }
         }
-
-        if (totalPayout > 0) {
-            users[_user].matrixRoyaltyVault += totalPayout;
-            emit NFTRewardsClaimed(_user, totalPayout);
-        }
+        if (pay > 0) { users[_user].matrixRoyaltyVault += pay; }
     }
 
-    // ==========================================
-    // 💰 INVEST & BUBBLE-UP
-    // ==========================================
-
-    function invest(address _sponsor, uint256 _amount, bool _isTwentyEighty) external nonReentrant {
-        if (_amount < MIN_INVESTMENT) revert BelowMinLimit();
-        
-        InvestmentWindow storage window = userInvestmentWindows[msg.sender];
-        if (block.timestamp >= window.windowStartTime + 24 hours) {
-            window.windowStartTime = block.timestamp;
-            window.totalInvested = 0;
-        }
-        
-        if (window.totalInvested + _amount > MAX_INVESTMENT) revert ExceedsMaxInvest();
-        window.totalInvested += _amount;
-
+    // ── Invest ────────────────────────────────────────────────────────────────
+    function invest(address _sponsor, uint256 _amt, bool _isTE) external nonReentrant {
+        if (_amt < MIN_INVESTMENT)  revert InvalidAmount();
         if (_sponsor == address(0)) revert ZeroAddress();
-        _processOwnerPayout();
-        _autoLiquidateChunk();
-        
-        if (users[msg.sender].totalInvestment > 0) {
-            _internalClaimROI(msg.sender);
-            _internalClaimMatrixRoyalty(msg.sender);
-            _internalClaimNFTRewards(msg.sender);
-        }
 
-        address activeSponsor = users[msg.sender].sponsor == address(0) ? _sponsor : users[msg.sender].sponsor;
+        InvestmentWindow storage iw = userInvestmentWindows[msg.sender];
+        if (block.timestamp >= iw.windowStartTime + 24 hours) { iw.windowStartTime = block.timestamp; iw.totalInvested = 0; }
+        if (iw.totalInvested + _amt > MAX_INVESTMENT) revert InvalidAmount();
+        iw.totalInvested += _amt;
 
-        if (_amount >= 100 * 1e18 && activeSponsor != address(0) && activeSponsor != companyWallet) {
-            uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-            airdropEligible[activeSponsor][currentCycle + 1] = true; 
-        }
+        _runGlobalCheckpoints(msg.sender);
+        if (users[msg.sender].totalInvestment == 0) lastAirdropUpdate[msg.sender] = block.timestamp;
+
+        address aSponsor = users[msg.sender].sponsor == address(0) ? _sponsor : users[msg.sender].sponsor;
+        if (_amt >= 100e18 && aSponsor != address(0) && aSponsor != companyWallet)
+            airdropEligible[aSponsor][(block.timestamp - launchTime) / CYCLE_DURATION + 1] = true;
 
         if (users[msg.sender].sponsor == address(0) && msg.sender != companyWallet) {
             if (users[_sponsor].totalInvestment == 0 && _sponsor != companyWallet) revert InvalidSponsor();
-            
-            users[msg.sender].sponsor = _sponsor;
-            users[msg.sender].registrationTime = block.timestamp;
-            users[msg.sender].lastBaseClaimTime = block.timestamp;
-            users[msg.sender].lastAirdropCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-            users[msg.sender].lastClaimedCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
+            User storage u = users[msg.sender];
+            u.sponsor           = _sponsor;
+            u.registrationTime  = block.timestamp;
+            u.lastBaseClaimTime = block.timestamp;
+            uint256 curCycle    = (block.timestamp - launchTime) / CYCLE_DURATION;
+            u.lastAirdropCycle  = curCycle;
+            u.lastClaimedCycle  = curCycle;
 
             users[_sponsor].directReferralsCount++;
             if (users[_sponsor].directReferralsCount == 3) {
-                address up1 = users[_sponsor].sponsor;
-                if (up1 != address(0)) {
-                    users[up1].directsWith3Count++;
-                    if (users[up1].directsWith3Count == 3) {
-                        address up2 = users[up1].sponsor;
-                        if (up2 != address(0)) {
-                            users[up2].directsWith9Count++;
-                            if (users[up2].directsWith9Count == 3) {
-                                if (!users[up2].isMatrixUnlocked) {
-                                    users[up2].isMatrixUnlocked = true;
-                                    if (block.timestamp > users[up2].registrationTime + 30 days) {
-                                        users[up2].isTierZeroLocked = true;
-                                    }
-                                    
-                                    totalSharesPerTier[0]++;
-                                    uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-                                    userMatrixData[up2].upgradeCycle[0] = currentCycle + 1; 
-                                    emit MatrixUnlocked(up2, users[up2].isTierZeroLocked);
-                                }
+                address u1 = users[_sponsor].sponsor;
+                if (u1 != address(0)) {
+                    users[u1].directsWith3Count++;
+                    if (users[u1].directsWith3Count == 3) {
+                        address u2 = users[u1].sponsor;
+                        if (u2 != address(0)) {
+                            users[u2].directsWith9Count++;
+                            if (users[u2].directsWith9Count == 3 && !users[u2].isMatrixUnlocked) {
+                                users[u2].isMatrixUnlocked = true;
+                                if (block.timestamp > users[u2].registrationTime + 30 days) users[u2].isTierZeroLocked = true;
+                                totalSharesPerTier[0]++;
+                                userMatrixData[u2].upgradeCycle[0] = (block.timestamp - launchTime) / CYCLE_DURATION + 1;
+                                emit MatrixUnlocked(u2);
                             }
                         }
                     }
@@ -713,569 +450,326 @@ contract HMTMining is Ownable, ReentrancyGuard, IERC721Receiver {
             }
         }
 
-        USDT.safeTransferFrom(msg.sender, address(this), _amount);
-        uint256 fee = _amount < 10 * 1e18 ? 1 * 1e18 : (_amount * 10) / 100;
-        USDT.safeTransfer(companyWallet, fee);
-        emit FeePaid(msg.sender, fee);
-
-        uint256 netAmount = _amount - fee;
-        uint256 swapRatio = _isTwentyEighty ? 20 : 80;
-        uint256 swapAmount = (netAmount * swapRatio) / 100;
-        
-        _buyHMT(swapAmount);
-
-        users[msg.sender].totalInvestment += _amount;
-        
-        if (_amount == MAX_INVESTMENT) { 
-            try NFT.mintRewardNFT(msg.sender, 1) {} catch {}
-        }
-
-        _updateUplineVolume(msg.sender, _amount);
-        _distributeMatrixRoyalty(_amount);
-
-        emit Invested(msg.sender, _amount, _isTwentyEighty);
+        USDT.transferFrom(msg.sender, address(this), _amt);
+        uint256 fee = _amt < 10e18 ? 1e18 : (_amt * 10) / 100;
+        USDT.transfer(companyWallet, fee);
+        _buyHMT(((_amt - fee) * (_isTE ? 20 : 80)) / 100);
+        users[msg.sender].totalInvestment += _amt;
+        if (_amt == MAX_INVESTMENT) { try NFT.mintRewardNFT(msg.sender, 1) {} catch {} }
+        _updateUplineVolume(msg.sender, _amt);
+        _distributeMatrixRoyalty(_amt);
+        emit Invested(msg.sender, _amt);
     }
 
-    function _buyHMT(uint256 usdtAmount) internal {
-        USDT.approve(address(pancakeRouter), 0);
-        USDT.approve(address(pancakeRouter), usdtAmount);
-        uint256 expectedHMT = HMT.getHMTForUSDT(usdtAmount);
-        uint256 minOut = (expectedHMT * 75) / 100; 
-
+    function _buyHMT(uint256 _uAmt) internal {
+        USDT.approve(address(pancakeRouter), _uAmt);
         address[] memory path = new address[](2);
-        path[0] = address(USDT);
-        path[1] = address(HMT);
-
-        pancakeRouter.swapExactTokensForTokens(usdtAmount, minOut, path, address(this), block.timestamp + 300);
+        path[0] = address(USDT); path[1] = address(HMT);
+        pancakeRouter.swapExactTokensForTokens(_uAmt, (HMT.getHMTForUSDT(_uAmt) * 75) / 100, path, address(this), block.timestamp + 300);
     }
 
-    function _updateUplineVolume(address _investor, uint256 _amount) internal {
-        address currentBranch = _investor;
-        address upline = users[currentBranch].sponsor;
-        
-        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 currentWeek = (block.timestamp - launchTime) / 7 days;
-        for (uint16 depth = 0; depth < MAX_DEPTH; depth++) {
-            if (upline == address(0)) break;
-            users[upline].totalTeamVolume += _amount;
-            legVolume[upline][currentBranch] += _amount;
-            
-            if (legVolume[upline][currentBranch] > users[upline].strongestLegVolume) {
-                users[upline].strongestLegVolume = legVolume[upline][currentBranch];
-                users[upline].strongestLegUser = currentBranch;
+    function _updateUplineVolume(address _inv, uint256 _amt) internal {
+        address cB   = _inv;
+        address up   = users[cB].sponsor;
+        uint256 cCyc = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256 cWk  = (block.timestamp - launchTime) / 7 days;
+        for (uint16 d; d < 50; d++) {
+            if (up == address(0)) break;
+            users[up].totalTeamVolume += _amt;
+            legVolume[up][cB] += _amt;
+            if (legVolume[up][cB] > users[up].strongestLegVolume) {
+                users[up].strongestLegVolume = legVolume[up][cB];
+                users[up].strongestLegUser   = cB;
             }
-
-            cycleTotalVolume[upline][currentCycle] += _amount;
-            cycleLegVolume[upline][currentBranch][currentCycle] += _amount;
-            
-            if (cycleLegVolume[upline][currentBranch][currentCycle] > cycleStrongestLegVolume[upline][currentCycle]) {
-                cycleStrongestLegVolume[upline][currentCycle] = cycleLegVolume[upline][currentBranch][currentCycle];
-            }
-
-            weeklyTotalVolume[upline][currentWeek] += _amount;
-            weeklyLegVolume[upline][currentBranch][currentWeek] += _amount;
-
-            if (weeklyLegVolume[upline][currentBranch][currentWeek] > weeklyStrongestLegVolume[upline][currentWeek]) {
-                weeklyStrongestLegVolume[upline][currentWeek] = weeklyLegVolume[upline][currentBranch][currentWeek];
-            }
-
-            currentBranch = upline;
-            upline = users[upline].sponsor;
+            cycleTotalVolume[up][cCyc]   += _amt;
+            cycleLegVolume[up][cB][cCyc] += _amt;
+            if (cycleLegVolume[up][cB][cCyc] > cycleStrongestLegVolume[up][cCyc])
+                cycleStrongestLegVolume[up][cCyc] = cycleLegVolume[up][cB][cCyc];
+            weeklyTotalVolume[up][cWk]   += _amt;
+            weeklyLegVolume[up][cB][cWk] += _amt;
+            if (weeklyLegVolume[up][cB][cWk] > weeklyStrongestLegVolume[up][cWk])
+                weeklyStrongestLegVolume[up][cWk] = weeklyLegVolume[up][cB][cWk];
+            cB = up;
+            up = users[up].sponsor;
         }
     }
 
-    // ==========================================
-    // 📊 PHASE 2: DUAL ROI & LEVEL INCOME
-    // ==========================================
-
-    function isAirdropEligibleThisCycle(address _user) public view returns (bool) {
-        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        return airdropEligible[_user][currentCycle];
+    function _distributeMatrixRoyalty(uint256 _amt) internal {
+        uint256 cC   = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256 pool = (_amt * 18) / 100;
+        for (uint8 i; i <= 9; i++) {
+            if (totalSharesPerTier[i] > 0)
+                cycleRPS[cC][i] += (pool * _tierPct(i) * 1e18) / (100 * totalSharesPerTier[i]);
+        }
+        for (uint8 i = 1; i <= 7; i++) {
+            if (nftTotalSharesPerTier[i] > 0)
+                cycleNFTRPS[cC][i] += (pool * _nftTierPct(i) * 1e18) / (100 * nftTotalSharesPerTier[i]);
+        }
     }
-    
-    function isAirdropUnlockedForNextCycle(address _user) public view returns (bool) {
-        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        return airdropEligible[_user][currentCycle + 1];
+
+    // ── Airdrop ───────────────────────────────────────────────────────────────
+    function _checkpointAirdrop(address _user) internal {
+        User storage u = users[_user];
+        if (u.totalInvestment < 100e18 || u.hasWithdrawn) { lastAirdropUpdate[_user] = block.timestamp; return; }
+        uint256 lT = lastAirdropUpdate[_user] == 0 ? block.timestamp : lastAirdropUpdate[_user];
+        if (lT == block.timestamp) return;
+        uint256 sC  = (lT - launchTime) / CYCLE_DURATION;
+        uint256 eC  = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256 inv = u.totalInvestment;
+        for (uint256 c = sC; c <= eC; c++) {
+            uint256 cST = launchTime + c * CYCLE_DURATION;
+            uint256 tS  = lT > cST ? lT : cST;
+            uint256 tE  = block.timestamp < cST + CYCLE_DURATION ? block.timestamp : cST + CYCLE_DURATION;
+            if (tE > tS) cycleAirdropEarned[_user][c] += (inv * (tE - tS)) / 86400000;
+        }
+        lastAirdropUpdate[_user] = block.timestamp;
     }
 
-    function getPendingROI(address _user) public view returns (uint256 basePending, uint256 airdropPending) {
-        if (_user == companyWallet) return (0, 0);
+    // ── ROI ───────────────────────────────────────────────────────────────────
+    function getPendingROI(address _user) public view returns (uint256 bPend, uint256 aPend) {
+        if (_user == companyWallet || users[_user].totalInvestment == 0) return (0, 0);
         User memory u = users[_user];
-        if (u.totalInvestment == 0) return (0, 0);
-        uint256 baseCycles = (block.timestamp - u.lastBaseClaimTime) / 8 hours;
-        if (baseCycles > 0) {
-            uint256 rewardPerCycle = (u.totalInvestment * 2) / 1000;
-            uint256 calculatedBase = rewardPerCycle * baseCycles;
-            uint256 baseCap = u.totalInvestment; 
-            basePending = (u.baseClaimed + calculatedBase > baseCap) ?
-                (baseCap > u.baseClaimed ? baseCap - u.baseClaimed : 0) : calculatedBase;
+        uint256 bC = (block.timestamp - u.lastBaseClaimTime) / 8 hours;
+        if (bC > 0) {
+            uint256 cB = (u.totalInvestment * 2 * bC) / 1000;
+            bPend = (u.baseClaimed + cB > u.totalInvestment)
+                ? (u.totalInvestment > u.baseClaimed ? u.totalInvestment - u.baseClaimed : 0) : cB;
         }
-
-        if (u.totalInvestment >= 100 * 1e18 && !u.hasWithdrawn) {
-            uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-            uint256 airdropCap = u.totalInvestment * 5;
-            uint256 cycleReward = (u.totalInvestment * 28) / 1000; 
-            
-            for (uint256 c = u.lastAirdropCycle; c < actualCycle; c++) {
-                if (airdropEligible[_user][c]) {
-                    airdropPending += cycleReward;
+        if (u.totalInvestment >= 100e18 && !u.hasWithdrawn) {
+            uint256 cC  = (block.timestamp - launchTime) / CYCLE_DURATION;
+            uint256 lT  = lastAirdropUpdate[_user] == 0 ? u.registrationTime : lastAirdropUpdate[_user];
+            uint256 sC  = (lT - launchTime) / CYCLE_DURATION;
+            for (uint256 c = u.lastAirdropCycle; c < cC; c++) {
+                uint256 cE = cycleAirdropEarned[_user][c];
+                if (c >= sC && lT < launchTime + (c + 1) * CYCLE_DURATION) {
+                    uint256 cST = launchTime + c * CYCLE_DURATION;
+                    uint256 tS  = lT > cST ? lT : cST;
+                    uint256 tE  = block.timestamp < cST + CYCLE_DURATION ? block.timestamp : cST + CYCLE_DURATION;
+                    if (tE > tS) cE += (u.totalInvestment * (tE - tS)) / 86400000;
                 }
+                if (airdropEligible[_user][c]) aPend += cE;
             }
-            
-            if (u.airdropClaimed + airdropPending > airdropCap) {
-                airdropPending = airdropCap > u.airdropClaimed ? airdropCap - u.airdropClaimed : 0;
-            }
+            uint256 aCap = u.totalInvestment * 5;
+            if (u.airdropClaimed + aPend > aCap) aPend = aCap > u.airdropClaimed ? aCap - u.airdropClaimed : 0;
         }
-        
-        return (basePending, airdropPending);
     }
 
-    function claimROI() external nonReentrant {
-        _processOwnerPayout();
-        _autoLiquidateChunk();
-
-        _internalClaimROI(msg.sender);
-        _internalClaimMatrixRoyalty(msg.sender);
-        _internalClaimNFTRewards(msg.sender);
-    }
+    function claimROI() external nonReentrant { _runGlobalCheckpoints(msg.sender); }
 
     function _internalClaimROI(address _user) internal {
-        (uint256 basePending, uint256 airdropPending) = getPendingROI(_user);
-
+        _checkpointAirdrop(_user);
         User storage u = users[_user];
-        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-
-        if (basePending > 0) {
-            uint256 baseCycles = (block.timestamp - u.lastBaseClaimTime) / 8 hours;
-            u.lastBaseClaimTime += (baseCycles * 8 hours);
-            u.baseClaimed += basePending;
-            u.levelIncomeVault += basePending; 
-            
-            _distributeLevelIncome(_user, basePending);
-        }
-
-        if (u.totalInvestment >= 100 * 1e18 && !u.hasWithdrawn) {
-            if (actualCycle > u.lastAirdropCycle) {
-                u.lastAirdropCycle = actualCycle;
-                if (airdropPending > 0) {
-                    u.airdropClaimed += airdropPending;
-                    u.airdropVault += airdropPending; 
-                }
-            }
-        }
-        
-        if (basePending > 0 || airdropPending > 0) {
-            emit ROIClaimed(_user, basePending, airdropPending);
-        }
-    }
-
-    function _distributeLevelIncome(address _claimer, uint256 _baseROI) internal {
-        uint256 minInvestmentRequired = 100 * 1e18;
-        address sponsorL1 = users[_claimer].sponsor;
-        
-        if (sponsorL1 != address(0)) {
-            if (users[sponsorL1].directReferralsCount >= 1 && users[sponsorL1].totalInvestment >= minInvestmentRequired) {
-                uint256 l1Reward = (_baseROI * 15) / 100;
-                users[sponsorL1].levelIncomeVault += l1Reward;
-                emit LevelIncomeDistributed(sponsorL1, _claimer, l1Reward, 1);
-            }
-
-            address sponsorL2 = users[sponsorL1].sponsor;
-            if (sponsorL2 != address(0)) {
-                if (users[sponsorL2].directReferralsCount >= 2 && users[sponsorL2].totalInvestment >= minInvestmentRequired) {
-                    uint256 l2Reward = (_baseROI * 10) / 100;
-                    users[sponsorL2].levelIncomeVault += l2Reward;
-                    emit LevelIncomeDistributed(sponsorL2, _claimer, l2Reward, 2);
-                }
-
-                address sponsorL3 = users[sponsorL2].sponsor;
-                if (sponsorL3 != address(0)) {
-                    if (users[sponsorL3].directReferralsCount >= 3 && users[sponsorL3].totalInvestment >= minInvestmentRequired) {
-                        uint256 l3Reward = (_baseROI * 5) / 100;
-                        users[sponsorL3].levelIncomeVault += l3Reward;
-                        emit LevelIncomeDistributed(sponsorL3, _claimer, l3Reward, 3);
+        uint256 aC = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint256 bC = (block.timestamp - u.lastBaseClaimTime) / 8 hours;
+        uint256 bP;
+        if (bC > 0) {
+            uint256 cB = (u.totalInvestment * 2 * bC) / 1000;
+            bP = (u.baseClaimed + cB > u.totalInvestment)
+                ? (u.totalInvestment > u.baseClaimed ? u.totalInvestment - u.baseClaimed : 0) : cB;
+            if (bP > 0) {
+                u.lastBaseClaimTime += bC * 8 hours;
+                u.baseClaimed       += bP;
+                u.levelIncomeVault  += bP;
+                address cS = u.sponsor;
+                if (cS != address(0)) {
+                    if (users[cS].directReferralsCount >= 1 && users[cS].totalInvestment >= 100e18)
+                        users[cS].levelIncomeVault += (bP * 15) / 100;
+                    address cS2 = users[cS].sponsor;
+                    if (cS2 != address(0)) {
+                        if (users[cS2].directReferralsCount >= 2 && users[cS2].totalInvestment >= 100e18)
+                            users[cS2].levelIncomeVault += (bP * 10) / 100;
+                        address cS3 = users[cS2].sponsor;
+                        if (cS3 != address(0) && users[cS3].directReferralsCount >= 3 && users[cS3].totalInvestment >= 100e18)
+                            users[cS3].levelIncomeVault += (bP * 5) / 100;
                     }
                 }
             }
         }
+        uint256 aP;
+        if (u.totalInvestment >= 100e18 && !u.hasWithdrawn && aC > u.lastAirdropCycle) {
+            for (uint256 c = u.lastAirdropCycle; c < aC; c++) {
+                if (airdropEligible[_user][c]) aP += cycleAirdropEarned[_user][c];
+            }
+            if (aP > 0) {
+                uint256 aCap = u.totalInvestment * 5;
+                if (u.airdropClaimed + aP > aCap) aP = aCap > u.airdropClaimed ? aCap - u.airdropClaimed : 0;
+                u.airdropClaimed += aP;
+                u.airdropVault   += aP;
+            }
+            u.lastAirdropCycle = aC;
+        }
+        // vault credited above
     }
 
-    // ==========================================
-    // 👑 PHASE 3: POOL DISTRIBUTIONS
-    // ==========================================
-
-    function getLifetimeWeakerLegsVolume(address _user) public view returns (uint256) {
-        return users[_user].totalTeamVolume - users[_user].strongestLegVolume;
-    }
-
-    function getCycleWeakerLegsVolume(address _user, uint256 cycleId) public view returns (uint256) {
-        return cycleTotalVolume[_user][cycleId] - cycleStrongestLegVolume[_user][cycleId];
-    }
-
-    function getWeeklyWeakerLegsVolume(address _user, uint256 weekId) public view returns (uint256) {
-        return weeklyTotalVolume[_user][weekId] - weeklyStrongestLegVolume[_user][weekId];
-    }
-
-    function getMatrixRoyaltyTier(address _user) public view returns (uint8 tier) {
-        User memory u = users[_user];
-        uint256 weakerVol = getLifetimeWeakerLegsVolume(_user);
-        uint256 strongVol = u.strongestLegVolume;
-
-        uint256 qualifyingVol = weakerVol < strongVol ? weakerVol : strongVol;
-        if (qualifyingVol >= 18835000 * 1e18 && u.totalInvestment >= 10000 * 1e18 && u.directReferralsCount >= 9) return 9;
-        if (qualifyingVol >= 8835000 * 1e18 && u.totalInvestment >= 9000 * 1e18 && u.directReferralsCount >= 8) return 8;
-        if (qualifyingVol >= 3835000 * 1e18 && u.totalInvestment >= 7000 * 1e18 && u.directReferralsCount >= 7) return 7;
-        if (qualifyingVol >= 1835000 * 1e18 && u.totalInvestment >= 5000 * 1e18 && u.directReferralsCount >= 6) return 6;
-        if (qualifyingVol >= 835000 * 1e18 && u.totalInvestment >= 2500 * 1e18 && u.directReferralsCount >= 5) return 5;
-        if (qualifyingVol >= 335000 * 1e18 && u.totalInvestment >= 1000 * 1e18 && u.directReferralsCount >= 4) return 4;
-        if (qualifyingVol >= 135000 * 1e18 && u.totalInvestment >= 500 * 1e18 && u.directReferralsCount >= 3) return 3;
-        if (qualifyingVol >= 35000 * 1e18 && u.totalInvestment >= 250 * 1e18 && u.directReferralsCount >= 2) return 2;
-        if (qualifyingVol >= 10000 * 1e18 && u.totalInvestment >= 100 * 1e18 && u.directReferralsCount >= 1) return 1;
-
+    // ── Matrix royalty ────────────────────────────────────────────────────────
+    function getMatrixRoyaltyTier(address _user) public view returns (uint8) {
+        User memory u    = users[_user];
+        uint256 wVol = u.totalTeamVolume - u.strongestLegVolume;
+        uint256 qVol = wVol < u.strongestLegVolume ? wVol : u.strongestLegVolume;
+        uint256 inv  = u.totalInvestment;
+        uint256 refs = u.directReferralsCount;
+        if (qVol >= 18835000e18 && inv >= 10000e18 && refs >= 9) return 9;
+        if (qVol >=  8835000e18 && inv >=  9000e18 && refs >= 8) return 8;
+        if (qVol >=  3835000e18 && inv >=  7000e18 && refs >= 7) return 7;
+        if (qVol >=  1835000e18 && inv >=  5000e18 && refs >= 6) return 6;
+        if (qVol >=   835000e18 && inv >=  2500e18 && refs >= 5) return 5;
+        if (qVol >=   335000e18 && inv >=  1000e18 && refs >= 4) return 4;
+        if (qVol >=   135000e18 && inv >=   500e18 && refs >= 3) return 3;
+        if (qVol >=    35000e18 && inv >=   250e18 && refs >= 2) return 2;
+        if (qVol >=    10000e18 && inv >=   100e18 && refs >= 1) return 1;
         return 0;
     }
 
-    function _distributeMatrixRoyalty(uint256 _investmentAmount) internal {
-        uint256 currentCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 royaltyPool = (_investmentAmount * 18) / 100;
-        
-        for (uint8 i = 0; i <= 9; i++) {
-            if (totalSharesPerTier[i] > 0) {
-                uint256 tierCut = (royaltyPool * tierPercentages[i]) / 100;
-                cycleRPS[currentCycle][i] += (tierCut * 1e18) / totalSharesPerTier[i];
-            }
+    function _maintenancePassed(address _u, uint256 c) private view returns (bool) {
+        uint256 sW = c * 4;
+        for (uint256 w = sW; w < sW + 4; w++) {
+            if (weeklyTotalVolume[_u][w] - weeklyStrongestLegVolume[_u][w] < WEEKLY_MAINTENANCE) return false;
         }
+        return true;
+    }
 
-        for (uint8 i = 1; i <= 7; i++) {
-            if (nftTotalSharesPerTier[i] > 0) {
-                uint256 tierCut = (royaltyPool * nftTierPercentages[i]) / 100;
-                cycleNFTRPS[currentCycle][i] += (tierCut * 1e18) / nftTotalSharesPerTier[i];
+    function _resolveMatrixCycle(address _u, UserMatrix storage um, uint256 c) private view returns (uint256 cP, bool passed) {
+        passed = _maintenancePassed(_u, c);
+        if (passed && um.currentMatrixTier > 0) {
+            uint8 aT;
+            for (uint8 i = um.currentMatrixTier; i >= 1; i--) {
+                if (um.upgradeCycle[i] != 0 && c >= um.upgradeCycle[i]) { aT = i; break; }
             }
+            cP = aT > 0 ? cycleRPS[c][aT] : (c >= um.upgradeCycle[0] ? cycleRPS[c][0] : 0);
+        } else if (c >= um.upgradeCycle[0]) {
+            cP = cycleRPS[c][0];
         }
     }
 
-    function getPendingMatrixRewards(address _user) public view returns (uint256) {
-        User memory u = users[_user];
-        if (!u.isMatrixUnlocked) return 0;
-
-        UserMatrix storage um = userMatrixData[_user];
-        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 endCycle = actualCycle > u.lastClaimedCycle + MAX_CLAIM_CYCLES ? u.lastClaimedCycle + MAX_CLAIM_CYCLES : actualCycle;
-
-        uint256 totalScaledPayout = 0;
-        for (uint256 c = u.lastClaimedCycle; c < endCycle; c++) {
-            bool condition3Passed = true;
-            uint256 startWeek = c * 4; 
-            
-            for (uint256 w = startWeek; w < startWeek + 4; w++) {
-                if (getWeeklyWeakerLegsVolume(_user, w) < WEEKLY_MAINTENANCE) {
-                    condition3Passed = false;
-                    break;
-                }
-            }
-
-            uint256 cycleScaledPayout = 0;
-            if (condition3Passed && um.currentMatrixTier > 0) {
-                uint8 activeTier = 0;
-                for (uint8 i = um.currentMatrixTier; i >= 1; i--) {
-                    if (um.upgradeCycle[i] != 0 && c >= um.upgradeCycle[i]) {
-                        activeTier = i;
-                        break;
-                    }
-                }
-                
-                if (activeTier > 0) {
-                    cycleScaledPayout = cycleRPS[c][activeTier];
-                } else if (c >= um.upgradeCycle[0]) {
-                    cycleScaledPayout = cycleRPS[c][0];
-                }
-            } else {
-                if (c >= um.upgradeCycle[0]) {
-                    cycleScaledPayout = cycleRPS[c][0];
-                }
-            }
-            totalScaledPayout += cycleScaledPayout;
-        }
-        return totalScaledPayout / 1e18;
+    function getPendingMatrixRewards(address _u) public view returns (uint256) {
+        if (!users[_u].isMatrixUnlocked) return 0;
+        UserMatrix storage um = userMatrixData[_u];
+        uint256 last = users[_u].lastClaimedCycle;
+        uint256 eC   = (block.timestamp - launchTime) / CYCLE_DURATION;
+        if (eC > last + MAX_CLAIM_CYCLES) eC = last + MAX_CLAIM_CYCLES;
+        uint256 tP;
+        for (uint256 c = last; c < eC; c++) { (uint256 cp,) = _resolveMatrixCycle(_u, um, c); tP += cp; }
+        return tP / 1e18;
     }
 
-   function _internalClaimMatrixRoyalty(address _user) internal {
-        User storage u = users[_user];
-        if (!u.isMatrixUnlocked) return;
-
-        uint256 actualCycle = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint8 qualifiedTier = u.isTierZeroLocked ? 0 : getMatrixRoyaltyTier(_user);
-        UserMatrix storage um = userMatrixData[_user];
-
-        if (actualCycle <= u.lastClaimedCycle && qualifiedTier <= um.currentMatrixTier) {
-            return;
+    function _internalClaimMatrixRoyalty(address _u) internal {
+        User storage usr = users[_u];
+        if (!usr.isMatrixUnlocked) return;
+        uint256 aC = (block.timestamp - launchTime) / CYCLE_DURATION;
+        uint8   qT = usr.isTierZeroLocked ? 0 : getMatrixRoyaltyTier(_u);
+        UserMatrix storage um = userMatrixData[_u];
+        if (aC <= usr.lastClaimedCycle && qT <= um.currentMatrixTier) return;
+        if (qT > um.currentMatrixTier) {
+            if (um.currentMatrixTier > 0 && totalSharesPerTier[um.currentMatrixTier] > 0)
+                totalSharesPerTier[um.currentMatrixTier]--;
+            totalSharesPerTier[qT]++;
+            for (uint8 i = um.currentMatrixTier + 1; i <= qT; i++) um.upgradeCycle[i] = aC + 1;
+            um.currentMatrixTier = qT;
         }
-
-        if (qualifiedTier > um.currentMatrixTier) {
-            if (um.currentMatrixTier > 0) {
-                if (totalSharesPerTier[um.currentMatrixTier] > 0) {
-                    totalSharesPerTier[um.currentMatrixTier]--;
-                }
-            }
-            totalSharesPerTier[qualifiedTier]++;
-            for (uint8 i = um.currentMatrixTier + 1; i <= qualifiedTier; i++) {
-                um.upgradeCycle[i] = actualCycle + 1;
-            }
-            um.currentMatrixTier = qualifiedTier;
-            emit MatrixTierUpgraded(_user, qualifiedTier, actualCycle + 1);
+        uint256 eC = aC > usr.lastClaimedCycle + MAX_CLAIM_CYCLES ? usr.lastClaimedCycle + MAX_CLAIM_CYCLES : aC;
+        uint256 tP;
+        for (uint256 c = usr.lastClaimedCycle; c < eC; c++) {
+            (uint256 cP,) = _resolveMatrixCycle(_u, um, c);
+            tP += cP;
         }
-
-        uint256 totalScaledPayout = 0;
-        uint256 endCycle = actualCycle > u.lastClaimedCycle + MAX_CLAIM_CYCLES ? u.lastClaimedCycle + MAX_CLAIM_CYCLES : actualCycle;
-        for (uint256 c = u.lastClaimedCycle; c < endCycle; c++) {
-            bool condition3Passed = true;
-            uint256 startWeek = c * 4; 
-            
-            for (uint256 w = startWeek; w < startWeek + 4; w++) {
-                if (getWeeklyWeakerLegsVolume(_user, w) < WEEKLY_MAINTENANCE) {
-                    condition3Passed = false;
-                    break;
-                }
-            }
-            
-            uint256 cycleScaledPayout = 0;
-            if (condition3Passed && um.currentMatrixTier > 0) {
-                uint8 activeTier = 0;
-                for (uint8 i = um.currentMatrixTier; i >= 1; i--) {
-                    if (um.upgradeCycle[i] != 0 && c >= um.upgradeCycle[i]) {
-                        activeTier = i;
-                        break;
-                    }
-                }
-                
-                if (activeTier > 0) {
-                    cycleScaledPayout = cycleRPS[c][activeTier];
-                } else if (c >= um.upgradeCycle[0]) {
-                    cycleScaledPayout = cycleRPS[c][0];
-                }
-            } else {
-                if (c >= um.upgradeCycle[0]) {
-                    cycleScaledPayout = cycleRPS[c][0];
-                }
-            }
-            
-            totalScaledPayout += cycleScaledPayout;
-            if (cycleScaledPayout > 0) {
-                emit MatrixRoyaltyClaimed(_user, cycleScaledPayout / 1e18, c, condition3Passed);
-            }
-        }
-
-        if (endCycle > u.lastClaimedCycle) {
-            u.lastClaimedCycle = endCycle;
-        }
-
-        if (totalScaledPayout > 0) {
-            uint256 finalPayout = totalScaledPayout / 1e18;
-            u.matrixRoyaltyVault += finalPayout;
+        if (eC > usr.lastClaimedCycle) usr.lastClaimedCycle = eC;
+        if (tP > 0) {
+            uint256 payout = tP / 1e18;
+            usr.matrixRoyaltyVault += payout;
+            emit MatrixRoyaltySettled(_u, payout);
         }
     }
 
-    // ==========================================
-    // 🥩 HMT TOKEN STAKING ENGINE
-    // ==========================================
-    function stakeHMTTokens(uint256 _amount) external nonReentrant {
-        if (_amount == 0) revert InvalidAmount();
-        HMT.safeTransferFrom(msg.sender, address(this), _amount);
-
-        userTokenStakes[msg.sender].push(TokenStake({
-            amount: _amount,
-            startTime: block.timestamp
-        }));
-        emit TokensStaked(msg.sender, _amount, userTokenStakes[msg.sender].length - 1);
+    // ── HMT Token Staking ─────────────────────────────────────────────────────
+    function stakeHMTTokens(uint256 _amt) external nonReentrant {
+        if (_amt == 0) revert InvalidAmount();
+        HMT.transferFrom(msg.sender, address(this), _amt);
+        userTokenStakes[msg.sender].push(TokenStake({ amount: _amt, startTime: block.timestamp }));
     }
 
-    function _calculateCompoundInterest(uint256 _principal, uint256 _cyclesPassed) internal pure returns (uint256) {
-        uint256 amount = _principal;
-        for(uint256 i = 0; i < _cyclesPassed; i++) {
-            amount = (amount * 1002) / 1000; 
+    function getStakingOverview(address _user) public view returns (uint256 tG, uint256 tP, uint256 nP) {
+        TokenStake[] memory stks = userTokenStakes[_user];
+        for (uint256 i; i < stks.length; i++) {
+            uint256 elapsed = block.timestamp - stks[i].startTime;
+            uint256 amt     = stks[i].amount;
+            uint256 periods = elapsed / 8 hours;
+            for (uint256 j; j < periods; j++) amt = (amt * 1002) / 1000;
+            tG += amt;
+            uint256 cyc    = elapsed / CYCLE_DURATION;
+            uint256 penPct = cyc == 0 ? 20 : cyc == 1 ? 15 : cyc == 2 ? 10 : cyc == 3 ? 8 : cyc == 4 ? 7 : cyc == 5 ? 6 : 0;
+            tP += (amt * penPct) / 100;
         }
-        return amount;
-    }
-
-    function getStakingOverview(address _user) public view returns (uint256 totalGrossAmount, uint256 totalPenaltyAmount, uint256 netPayout) {
-        TokenStake[] memory stakes = userTokenStakes[_user];
-        for (uint256 i = 0; i < stakes.length; i++) {
-            uint256 timeStaked = block.timestamp - stakes[i].startTime;
-            
-            uint256 cyclesPassed = timeStaked / 8 hours;
-            uint256 daysPassed = timeStaked / 1 days;
-
-            uint256 grossAmount = _calculateCompoundInterest(stakes[i].amount, cyclesPassed);
-            totalGrossAmount += grossAmount;
-
-            uint256 penaltyPercent = 0;
-            if (daysPassed < 30) {
-                penaltyPercent = 15;
-            } else if (daysPassed < 60) {
-                penaltyPercent = 10;
-            } else if (daysPassed < 90) {
-                penaltyPercent = 5;
-            } else if (daysPassed < 120) {
-                penaltyPercent = 3;
-            } else if (daysPassed < 150) {
-                penaltyPercent = 2;
-            } else if (daysPassed < 180) {
-                penaltyPercent = 1;
-            } else {
-                penaltyPercent = 0;
-            }
-
-            totalPenaltyAmount += (grossAmount * penaltyPercent) / 100;
-        }
-
-        netPayout = totalGrossAmount - totalPenaltyAmount;
-        return (totalGrossAmount, totalPenaltyAmount, netPayout);
+        nP = tG - tP;
     }
 
     function unstakeAllHMT() external nonReentrant {
-        if (userTokenStakes[msg.sender].length == 0) revert NoStakes();
-
-        (, uint256 totalPenalty, uint256 finalNetPayout) = getStakingOverview(msg.sender);
-
-        if (HMT.balanceOf(address(this)) < finalNetPayout) revert InsufficientLiquidity();
-
+        if (userTokenStakes[msg.sender].length == 0) revert InvalidAmount();
+        (,, uint256 n) = getStakingOverview(msg.sender);
+        if (HMT.balanceOf(address(this)) < n) revert InsufficientLiquidity();
         delete userTokenStakes[msg.sender];
-
-        HMT.safeTransfer(msg.sender, finalNetPayout);
-
-        emit AllTokensUnstaked(msg.sender, finalNetPayout, totalPenalty);
+        HMT.transfer(msg.sender, n);
     }
 
-    // ==========================================
-    // 💸 WITHDRAWAL ENGINE & FRONTEND VIEWS
-    // ==========================================
-
-    function getTotalWithdrawable(address _user) external view returns (uint256 regularTotal, uint256 airdropTotal) {
-        User memory u = users[_user];
-        uint256 vaultedRegular = u.levelIncomeVault + u.matrixRoyaltyVault;
-        uint256 vaultedAirdrop = u.airdropVault;
-        
-        uint256 basePending = 0;
-        uint256 airdropPending = 0;
-        if (_user != companyWallet && u.totalInvestment > 0) {
-            (basePending, airdropPending) = getPendingROI(_user);
-        }
-        
-        uint256 matrixPending = 0;
-        if (u.isMatrixUnlocked) matrixPending = getPendingMatrixRewards(_user); 
-        
-        uint256 nftPending = getPendingNFTRewards(_user);
-        
-        regularTotal = vaultedRegular + basePending + matrixPending + nftPending;
-        airdropTotal = vaultedAirdrop + airdropPending;
+    // ── View helpers ──────────────────────────────────────────────────────────
+    function getTotalWithdrawable(address _u) external view returns (uint256 rT, uint256 aT) {
+        User memory usr = users[_u];
+        (uint256 bP, uint256 aP) = (_u != companyWallet && usr.totalInvestment > 0) ? getPendingROI(_u) : (0, 0);
+        rT = usr.levelIncomeVault + usr.matrixRoyaltyVault + bP + (usr.isMatrixUnlocked ? getPendingMatrixRewards(_u) : 0) + getPendingNFTRewards(_u);
+        aT = usr.airdropVault + aP;
     }
 
-    function getDailyWithdrawLimit(address _user) public view returns (uint256 maxDaily, uint256 remainingToday) {
-        uint256 userInvested = users[_user].totalInvestment;
-        uint256 calculatedLimit = (userInvested * 10) / 100;
-        
-        uint256 hardCap = 1000 * 1e18;
-        maxDaily = calculatedLimit > hardCap ? hardCap : calculatedLimit;
-
-        WithdrawWindow memory window = userWithdrawWindows[_user];
-        
-        if (block.timestamp < window.windowStartTime + 24 hours) {
-            maxDaily = window.maxDailyLimit; 
-            remainingToday = maxDaily > window.withdrawnAmount ? maxDaily - window.withdrawnAmount : 0;
-        } 
-        else {
-            remainingToday = maxDaily;
-        }
+    function getDailyWithdrawLimit(address _u) public view returns (uint256 mD, uint256 rT) {
+        uint256 cL = (users[_u].totalInvestment * 10) / 100;
+        mD = cL > 1000e18 ? 1000e18 : cL;
+        WithdrawWindow memory w = userWithdrawWindows[_u];
+        rT = block.timestamp < w.windowStartTime + 24 hours
+            ? (mD > w.withdrawnAmount ? mD - w.withdrawnAmount : 0) : mD;
     }
 
-    function withdraw(uint256 _amount, bool _isAirdropWithdrawal) external nonReentrant {
-        _processOwnerPayout();
-        _autoLiquidateChunk();
-
-        _internalClaimROI(msg.sender);
-        _internalClaimMatrixRoyalty(msg.sender);
-        _internalClaimNFTRewards(msg.sender);
-        
+    // ── Withdraw ──────────────────────────────────────────────────────────────
+    function withdraw(uint256 _amt, bool _isAir) external nonReentrant {
+        _runGlobalCheckpoints(msg.sender);
         User storage u = users[msg.sender];
-        
-        uint256 specificVaultAvailable;
-        if (_isAirdropWithdrawal) {
-            specificVaultAvailable = u.airdropVault;
+        if (_amt == 0 || (_isAir ? u.airdropVault : u.levelIncomeVault + u.matrixRoyaltyVault) < _amt) revert InsufficientVault();
+
+        uint256 dC = (u.totalInvestment * 10) / 100;
+        if (dC > 1000e18) dC = 1000e18;
+
+        WithdrawWindow storage w = userWithdrawWindows[msg.sender];
+        if (block.timestamp >= w.windowStartTime + 24 hours) { w.windowStartTime = block.timestamp; w.withdrawnAmount = 0; }
+        if (w.withdrawnAmount + _amt > dC) revert ExceedsDailyLimit();
+        w.withdrawnAmount += _amt;
+
+        if (_isAir) {
+            if (!u.hasWithdrawn) u.hasWithdrawn = true;
+            u.airdropVault -= _amt;
         } else {
-            specificVaultAvailable = u.levelIncomeVault + u.matrixRoyaltyVault;
-        }
-        
-        if (_amount == 0 || specificVaultAvailable < _amount) revert InsufficientVault();
-
-        uint256 userInvested = u.totalInvestment;
-        uint256 calculatedLimit = (userInvested * 10) / 100;
-        uint256 hardCap = 1000 * 1e18;
-        uint256 dailyCap = calculatedLimit > hardCap ? hardCap : calculatedLimit;
-
-        WithdrawWindow storage window = userWithdrawWindows[msg.sender];
-        
-        if (block.timestamp >= window.windowStartTime + 24 hours) {
-            window.windowStartTime = block.timestamp;
-            window.withdrawnAmount = 0;
-            window.maxDailyLimit = dailyCap; 
-        }
-        
-        if (window.withdrawnAmount + _amount > window.maxDailyLimit) revert ExceedsDailyLimit();
-        
-        window.withdrawnAmount += _amount;
-
-        if (_isAirdropWithdrawal) {
-            if (!u.hasWithdrawn) {
-                u.hasWithdrawn = true;
-                emit AirdropForfeited(msg.sender);
-            }
-            u.airdropVault -= _amount;
-        } else {
-            if (_amount <= u.levelIncomeVault) {
-                u.levelIncomeVault -= _amount;
-            } else {
-                uint256 remainder = _amount - u.levelIncomeVault;
-                u.levelIncomeVault = 0;
-                u.matrixRoyaltyVault -= remainder;
-            }
+            if (_amt <= u.levelIncomeVault) u.levelIncomeVault -= _amt;
+            else { u.matrixRoyaltyVault -= (_amt - u.levelIncomeVault); u.levelIncomeVault = 0; }
         }
 
-        uint256 fee = (_amount * 5) / 100;
-        uint256 netPayoutUSDT = _amount - fee;
-        USDT.safeTransfer(ownerWallet, fee);
+        uint256 fee = (_amt * 5) / 100;
+        USDT.transfer(ownerWallet, fee);
 
-        uint256 currentHMTPriceInUSDT = HMT.getUSDTForHMT(1e18);
-        uint256 targetPrice = 5 * 1e18;
-        bool paidInHMT = false;
-
-        if (!isPayoutLockedToHMT && currentHMTPriceInUSDT >= targetPrice) {
-            isPayoutLockedToHMT = true;
-        }
+        if (!isPayoutLockedToHMT && HMT.getUSDTForHMT(1e18) >= 5e18) isPayoutLockedToHMT = true;
 
         if (!isPayoutLockedToHMT) {
-            USDT.safeTransfer(msg.sender, netPayoutUSDT);
+            USDT.transfer(msg.sender, _amt - fee);
+            emit Withdrawn(msg.sender, _amt, false);
         } else {
-            uint256 hmtToPayout = HMT.getHMTForUSDT(netPayoutUSDT);
-            if (HMT.balanceOf(address(this)) < hmtToPayout) revert InsufficientLiquidity();
-            HMT.safeTransfer(msg.sender, hmtToPayout);
-            paidInHMT = true;
+            uint256 hmtPay = HMT.getHMTForUSDT(_amt - fee);
+            if (HMT.balanceOf(address(this)) < hmtPay) revert InsufficientLiquidity();
+            HMT.transfer(msg.sender, hmtPay);
+            emit Withdrawn(msg.sender, _amt, true);
         }
-
-        emit Withdrawn(msg.sender, _amount, paidInHMT);
     }
-    
-    // ==========================================
-    // 💱 OTC SWAP ENGINE (HMT -> USDT)
-    // ==========================================
 
-    function swapHMTForUSDT(uint256 _hmtAmount) external nonReentrant {
-        if (_hmtAmount == 0) revert InvalidAmount();
-        uint256 usdtPayout = HMT.getUSDTForHMT(_hmtAmount);
-        if (USDT.balanceOf(address(this)) < usdtPayout) revert InsufficientLiquidity();
-        
-        HMT.safeTransferFrom(msg.sender, address(this), _hmtAmount);
-        USDT.safeTransfer(msg.sender, usdtPayout);
-        
-        emit HMTSwappedForUSDT(msg.sender, _hmtAmount, usdtPayout);
+    // ── Swap ──────────────────────────────────────────────────────────────────
+    function swapHMTForUSDT(uint256 _hAmt) external nonReentrant {
+        if (_hAmt == 0) revert InvalidAmount();
+        uint256 uPay = HMT.getUSDTForHMT(_hAmt);
+        if (USDT.balanceOf(address(this)) < uPay) revert InsufficientLiquidity();
+        HMT.transferFrom(msg.sender, address(this), _hAmt);
+        USDT.transfer(msg.sender, uPay);
     }
 }

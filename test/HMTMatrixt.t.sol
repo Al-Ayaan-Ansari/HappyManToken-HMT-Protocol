@@ -32,7 +32,6 @@ contract HMTMatrixTest is Test {
     address constant BSC_USDT = 0x55d398326f99059fF775485246999027B3197955;
     address public company = address(0x100);
     address public ownerWallet = address(0x200);
-
     uint160 private dummyNonce = 2000000;
 
     function setUp() public {
@@ -60,20 +59,13 @@ contract HMTMatrixTest is Test {
         hmt.transfer(address(mining), 1_000_000 * 1e18);
     }
 
-    // 🟢 Upgraded Smart Invest
-   // 🟢 Upgraded Smart Invest (V2 24-Hour Window Compatible)
     function _invest(address _user, address _sponsor, uint256 _totalAmount) internal {
-        // Read the new V2 InvestmentWindow struct
         (uint256 windowStartTime, uint256 windowTotalInvested) = mining.userInvestmentWindows(_user);
-        
-        // If 24 hours have passed, their invested amount for the current window is effectively 0
         uint256 userInvestedToday = (block.timestamp >= windowStartTime + 24 hours) ? 0 : windowTotalInvested;
         
         uint256 userCanInvest = 2500 * 1e18 > userInvestedToday ? (2500 * 1e18) - userInvestedToday : 0;
-        
         uint256 amountForUser = _totalAmount > userCanInvest ? userCanInvest : _totalAmount;
-
-        // User invests whatever allowance they have left
+        
         if (amountForUser > 0) {
             deal(BSC_USDT, _user, amountForUser);
             vm.startPrank(_user);
@@ -82,7 +74,6 @@ contract HMTMatrixTest is Test {
             vm.stopPrank();
         }
 
-        // Remaining volume gets injected by uniquely generated dummies under the user
         uint256 amountLeft = _totalAmount - amountForUser;
         while(amountLeft > 0) {
             uint256 chunk = amountLeft > 2500 * 1e18 ? 2500 * 1e18 : amountLeft;
@@ -126,7 +117,7 @@ contract HMTMatrixTest is Test {
         uint8 currentTier = mining.userMatrixData(leader);
         assertEq(currentTier, 1, "Matching volume is 10k. Leader should be Tier 1.");
         assertEq(mining.totalSharesPerTier(1), 1, "Tier 1 pool should have 1 share.");
-
+        
         _invest(address(0x2002), leader, 25000 * 1e18); 
 
         vm.prank(leader);
