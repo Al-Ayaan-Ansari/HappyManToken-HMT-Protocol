@@ -23,7 +23,7 @@ contract HMT_NFT is ERC721, ERC721Enumerable, Ownable {
         uint256 price;
         uint256 maxSupply;
         uint256 minted;
-        bool ownerClaimed; // Tracks if the 10% allocation was minted
+        uint256 ownerMinted; // 🟢 UPGRADED: Tracks exact number of NFTs minted to owner for batching
     }
 
     mapping(uint8 => Tier) public tiers;
@@ -37,41 +37,68 @@ contract HMT_NFT is ERC721, ERC721Enumerable, Ownable {
         USDT = IERC20(_usdt);
         ownerWallet = _ownerWallet;
 
-        // 🟢 UPDATED: New exact max supplies as requested
-        tiers[1] = Tier(1000 * 1e18, 5000, 0, false);
-        tiers[2] = Tier(2500 * 1e18, 4000, 0, false);
-        tiers[3] = Tier(5000 * 1e18, 3000, 0, false);
-        tiers[4] = Tier(10000 * 1e18, 2000, 0, false);
-        tiers[5] = Tier(25000 * 1e18, 1000, 0, false);
-        tiers[6] = Tier(50000 * 1e18, 500, 0, false);
-        tiers[7] = Tier(100000 * 1e18, 250, 0, false);
+        // 🟢 UPDATED: Initialize ownerMinted counter to 0 instead of false
+        tiers[1] = Tier(1000 * 1e18, 5000, 0, 0);
+        tiers[2] = Tier(2500 * 1e18, 4000, 0, 0);
+        tiers[3] = Tier(5000 * 1e18, 3000, 0, 0);
+        tiers[4] = Tier(10000 * 1e18, 2000, 0, 0);
+        tiers[5] = Tier(25000 * 1e18, 1000, 0, 0);
+        tiers[6] = Tier(50000 * 1e18, 500, 0, 0);
+        tiers[7] = Tier(100000 * 1e18, 250, 0, 0);
     }
 
     // ==========================================
-    // 🟢 SAFE OWNER 10% ALLOCATION MINTING
+    // 🟢 SMART BATCH ALLOCATION MINTING
     // ==========================================
     
     /**
-     * @notice Mints exactly 10% of a specific tier's total supply to the owner.
-     * @dev Call this in a script loop (1 through 7) to avoid Block Gas Limit crashes.
+     * @notice Mints the 10% owner allocation in safe batches of 100 across all tiers.
+     * @dev Just keep calling this function until it reverts with "All allocations claimed".
      */
-    function claimOwnerAllocation(uint8 _tier) external onlyOwner {
-        require(_tier >= 1 && _tier <= 7, "Invalid Tier");
-        Tier storage t = tiers[_tier];
-        require(!t.ownerClaimed, "Allocation already claimed for this tier");
-        
-        t.ownerClaimed = true;
-        uint256 amountToMint = t.maxSupply / 10; // 10% of total supply
-        
-        require(t.minted + amountToMint <= t.maxSupply, "Exceeds max supply");
+    function claimOwnerAllocation() external onlyOwner {
+        uint256 batchLimit = 100;
+        uint256 mintedThisTx = 0;
 
-        t.minted += amountToMint;
+        // Automatically scans Tier 1 through Tier 7
+        for (uint8 i = 1; i <= 7; i++) {
+            Tier storage t = tiers[i];
+            
+            uint256 totalAllocation = t.maxSupply / 10; // 10% of total supply
+            uint256 remainingForThisTier = totalAllocation - t.ownerMinted;
 
-        for(uint256 i = 0; i < amountToMint; i++) {
-            uint256 tokenId = nextTokenId++;
-            tokenTier[tokenId] = _tier;
-            _safeMint(ownerWallet, tokenId);
+            if (remainingForThisTier > 0) {
+                // Calculate how many to mint in this specific iteration
+                uint256 toMint = remainingForThisTier;
+                
+                // If adding this tier's remainder exceeds our 100 batch limit, cap it
+                if (mintedThisTx + toMint > batchLimit) {
+                    toMint = batchLimit - mintedThisTx;
+                }
+
+                require(t.minted + toMint <= t.maxSupply, "Exceeds max supply");
+
+                // Update state before external minting calls
+                t.ownerMinted += toMint;
+                t.minted += toMint;
+
+                // Mint the batch
+                for (uint256 j = 0; j < toMint; j++) {
+                    uint256 tokenId = nextTokenId++;
+                    tokenTier[tokenId] = i;
+                    _safeMint(ownerWallet, tokenId);
+                }
+
+                mintedThisTx += toMint;
+
+                // If we hit our 100 NFT block gas safety limit, halt execution until next call
+                if (mintedThisTx >= batchLimit) {
+                    break;
+                }
+            }
         }
+        
+        // Reverts only when all 1,575 NFTs across all 7 tiers have been fully minted
+        require(mintedThisTx > 0, "All allocations claimed");
     }
 
     // ==========================================
