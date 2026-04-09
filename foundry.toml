@@ -7,4 +7,6 @@ auto_detect_remappings = true
 optimizer = true
 optimizer_runs = 1
 viaIR= true
+[rpc_endpoints]
+bsc = "https://bsc-dataseed.binance.org/"
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
