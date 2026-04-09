@@ -7,7 +7,7 @@ interface IHMTToken is IERC20 { function getHMTForUSDT(uint256) external view re
 interface IPancakeFactory { function getPair(address,address) external view returns(address); }
 interface IPancakePair { function token0() external view returns(address); function getReserves() external view returns(uint112,uint112,uint32); }
 interface IPancakeRouter02 { function factory() external pure returns(address); function swapExactTokensForTokens(uint256,uint256,address[] calldata,address,uint256) external returns(uint256[] memory); function addLiquidity(address,address,uint256,uint256,uint256,uint256,address,uint256) external returns(uint256,uint256,uint256); }
-interface INFTContract is IERC721 { function mintRewardNFT(address,uint8) external; function buyNFT(address,uint8) external; function getNFTTier(uint256) external view returns(uint8); function getTierPrice(uint8) external view returns(uint256); function ownerWallet() external view returns(address); }
+interface INFTContract { function mintRewardNFT(address,uint8) external; function buyNFT(address,uint8) external; function getNFTTier(uint256) external view returns(uint8); function getTierPrice(uint8) external view returns(uint256); function ownerWallet() external view returns(address); function ownerOf(uint256) external view returns(address); function transferFrom(address,address,uint256) external; }
 
 error E();
 
@@ -36,6 +36,7 @@ contract HMTMining {
     uint256 public constant AUTO_BATCH_SIZE          = 5;
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
+    // 🟢 2.1M HMT NFT Staking Reserve & Killswitch
     uint256 public constant MAX_NFT_STAKING_REWARDS  = 2_100_000 * 1e18;
     uint256 public totalNFTRewardsDistributed;
     bool    public isNFTStakingDisabled;
@@ -73,7 +74,7 @@ contract HMTMining {
 
     mapping(address => User) public users;
     mapping(address => UserMatrix) public userMatrixData;
-    mapping(address => mapping(uint256 => bool)) public airdropEligible;
+    mapping(address => mapping(uint256 => bool)) public cycleEligible; // Used for Airdrop & Matching Income
     mapping(address => uint256[]) public userStakedTokenIds;
     mapping(uint256 => mapping(address => bool)) public poolHasEntered;
     
@@ -85,18 +86,17 @@ contract HMTMining {
     mapping(address => mapping(uint256 => uint256)) private weeklyStrongestLegVolume;
     mapping(address => mapping(address => mapping(uint256 => uint256))) private weeklyLegVolume;
     
+    // 🟢 3x3 Family ROI Tracker
     mapping(address => mapping(uint256 => uint256)) public cycleFamilyROI;
     
+    // 🟢 7-Tier Matching Income Trackers
     uint256[8] public matchingSharesPerTier;
     mapping(uint256 => mapping(uint8 => uint256)) public cycleMatchingRPS;
     
     mapping(address => uint256) private lastAirdropUpdate;
     mapping(address => mapping(uint256 => uint256)) private cycleAirdropEarned;
     
-    uint256[8] private nftTotalSharesPerTier;
-    mapping(uint8 => uint256) private cumulativeNFTRPS; 
-    
-    struct StakedNFT  { uint8 tier; uint256 startCycle; uint256 rewardDebt; }
+    struct StakedNFT  { uint8 tier; uint256 startCycle; }
     mapping(uint256 => StakedNFT) private tokenStakingData;
 
     struct LotteryPool { uint256 startTime; address[] participants; bool isResolved; }
@@ -129,6 +129,9 @@ contract HMTMining {
         }
     }
 
+    // =====================================
+    // 🟢 COMPOUNDING MATH CORE
+    // =====================================
     function _calculateCompound(uint256 principal, uint256 periods) internal pure returns (uint256) {
         uint256 ratio = 1e18;
         uint256 base = 1002 * 1e15; // 0.2% every 8 hours = 0.6% daily
@@ -138,12 +141,6 @@ contract HMTMining {
             periods /= 2;
         }
         return (principal * ratio) / 1e18;
-    }
-
-    function _nftTierPct(uint8 i) internal pure returns (uint256) {
-        if (i == 0) return 0;
-        if (i <= 5) return uint256(i);
-        return i == 6 ? 10 : 15;
     }
 
     // =====================================
@@ -176,9 +173,8 @@ contract HMTMining {
         
         NFT.transferFrom(msg.sender, address(this), _tId);
         uint256 ac = (block.timestamp - launchTime) / CYCLE_DURATION;
-        tokenStakingData[_tId] = StakedNFT(t, ac + 1, cumulativeNFTRPS[t]);
+        tokenStakingData[_tId] = StakedNFT(t, ac + 1);
         userStakedTokenIds[msg.sender].push(_tId);
-        nftTotalSharesPerTier[t]++;
     }
 
     function unstakeNFT(uint256 _tId) external nonReentrant {
@@ -190,8 +186,6 @@ contract HMTMining {
         
         _internalClaimNFTRewards(msg.sender);
         
-        uint8 t = tokenStakingData[_tId].tier;
-        nftTotalSharesPerTier[t]--;
         ids[tIdx] = ids[len - 1];
         ids.pop();
         delete tokenStakingData[_tId];
@@ -210,18 +204,14 @@ contract HMTMining {
                 uint256 tp = NFT.getTierPrice(tier);
                 uint256 cyclesPassed = ac - s.startCycle;
                 
-                uint256 matrixShare = (cumulativeNFTRPS[tier] - s.rewardDebt) / 1e18;
-                uint256 guaranteedMin = tier > 1 ? (tp * cyclesPassed) / 100 : 0;
-                
-                pendUsdt += matrixShare > guaranteedMin ? matrixShare : guaranteedMin;
+                // Pure 1% Reward per cycle
+                pendUsdt += (tp * cyclesPassed) / 100;
             }
         }
         if (pendUsdt > 0) {
             pendHmt = HMT.getHMTForUSDT(pendUsdt);
         }
     }
-
-    function claimNFTRewards() external nonReentrant { _internalClaimNFTRewards(msg.sender); }
 
     function _internalClaimNFTRewards(address _user) internal {
         if (isNFTStakingDisabled) return;
@@ -237,13 +227,8 @@ contract HMTMining {
                 uint256 tp = NFT.getTierPrice(tier);
                 uint256 cyclesPassed = ac - s.startCycle;
                 
-                uint256 matrixShare = (cumulativeNFTRPS[tier] - s.rewardDebt) / 1e18;
-                uint256 guaranteedMin = tier > 1 ? (tp * cyclesPassed) / 100 : 0;
-                
-                payUsdt += matrixShare > guaranteedMin ? matrixShare : guaranteedMin;
-                
+                payUsdt += (tp * cyclesPassed) / 100;
                 s.startCycle = ac;
-                s.rewardDebt = cumulativeNFTRPS[tier];
             }
         }
         
@@ -299,7 +284,7 @@ contract HMTMining {
                     uint256 tE  = block.timestamp < cST + CYCLE_DURATION ? block.timestamp : cST + CYCLE_DURATION;
                     if (tE > tS) cE += (u.totalInvestment * (tE - tS)) / 86400000;
                 }
-                if (airdropEligible[_user][c]) aPend += cE;
+                if (cycleEligible[_user][c]) aPend += cE;
             }
             uint256 aCap = u.totalInvestment * 5;
             if (u.airdropClaimed + aPend > aCap) aPend = aCap > u.airdropClaimed ? aCap - u.airdropClaimed : 0;
@@ -345,7 +330,7 @@ contract HMTMining {
         uint256 aP;
         if (u.totalInvestment >= 100e18 && aC > u.lastAirdropCycle) {
             for (uint256 c = u.lastAirdropCycle; c < aC; c++) {
-                if (airdropEligible[_user][c]) aP += cycleAirdropEarned[_user][c];
+                if (cycleEligible[_user][c]) aP += cycleAirdropEarned[_user][c];
             }
             if (aP > 0) {
                 uint256 aCap = u.totalInvestment * 5;
@@ -406,8 +391,9 @@ contract HMTMining {
 
         address aSponsor = users[msg.sender].sponsor == address(0) ? _sponsor : users[msg.sender].sponsor;
         
+        // 🟢 Sets Cycle Maintenance for Matching Income & Airdrop
         if (_amt >= 100e18 && aSponsor != address(0) && aSponsor != insuranceWallet)
-            airdropEligible[aSponsor][(block.timestamp - launchTime) / CYCLE_DURATION] = true; 
+            cycleEligible[aSponsor][(block.timestamp - launchTime) / CYCLE_DURATION] = true; 
         
         if (users[msg.sender].sponsor == address(0) && msg.sender != insuranceWallet) {
             if (users[_sponsor].totalInvestment == 0 && _sponsor != insuranceWallet) revert E(); 
@@ -440,14 +426,6 @@ contract HMTMining {
         
         _updateUplineVolume(msg.sender, _amt);
         _distributeMatchingIncome(_amt);
-        
-        // Push 18% to NFT Stakers Pool
-        uint256 nftPool = (_amt * 18) / 100;
-        for (uint8 i = 1; i <= 7; i++) {
-            if (nftTotalSharesPerTier[i] > 0) {
-                cumulativeNFTRPS[i] += (nftPool * _nftTierPct(i) * 1e18) / (100 * nftTotalSharesPerTier[i]);
-            }
-        }
     }
 
     function _updateUplineVolume(address _inv, uint256 _amt) internal {
@@ -458,7 +436,7 @@ contract HMTMining {
         uint256 cEnd = launchTime + (cCyc + 1) * CYCLE_DURATION;
         uint256 secRem = cEnd > block.timestamp ? cEnd - block.timestamp : 0;
         
-        // Time-weighted daily ROI pushed directly to upline family variable
+        // 🟢 Time-weighted daily ROI pushed directly to upline 3x3 Family
         uint256 generatedROI = (_amt * 6 * secRem) / (1000 * 86400);
 
         for (uint16 d; d < 50; d++) {
@@ -485,7 +463,11 @@ contract HMTMining {
 
     function _distributeMatchingIncome(uint256 _amt) internal {
         uint256 cC = (block.timestamp - launchTime) / CYCLE_DURATION;
-        uint256 totalCycleROI = (_amt * 168) / 1000; 
+        uint256 cEnd = launchTime + (cC + 1) * CYCLE_DURATION;
+        uint256 secRem = cEnd > block.timestamp ? cEnd - block.timestamp : 0;
+        
+        // 🟢 O(1) Time-Weighted Global ROI calculation for Matching Income
+        uint256 totalCycleROI = (_amt * 6 * secRem) / (1000 * 86400); 
         
         uint256 pool_2_pct = (totalCycleROI * 2) / 100;
         uint256 pool_1_5_pct = (totalCycleROI * 15) / 1000;
@@ -531,8 +513,8 @@ contract HMTMining {
 
         for (uint256 c = usr.lastClaimedCycle; c < eC; c++) {
             
-            // Tier Matching Pool Claim
-            if (airdropEligible[_u][c] && um.currentMatrixTier > 0) {
+            // 🟢 Tier Matching Pool Claim
+            if (cycleEligible[_u][c] && um.currentMatrixTier > 0) {
                 uint8 aT;
                 for (int16 i = int16(uint16(um.currentMatrixTier)); i >= 1; i--) {
                     uint8 ui = uint8(uint16(i));
@@ -541,7 +523,7 @@ contract HMTMining {
                 if (aT > 0) totalPayout += cycleMatchingRPS[c][aT];
             }
 
-            // 3x3 Family ROI Claim
+            // 🟢 3x3 Family ROI Claim
             if (usr.isMatrixUnlocked && _maintenancePassed(_u, c)) {
                 uint256 rate = (usr.matrixUnlockTime - usr.registrationTime <= 28 days) ? 2 : 1;
                 uint256 famROI = cycleFamilyROI[_u][c];
